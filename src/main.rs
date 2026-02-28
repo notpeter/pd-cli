@@ -1,12 +1,15 @@
 use nusb::MaybeFuture;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::process::Command;
 
 const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
 const PLAYDATE_PRODUCT_ID_APP: u16 = 0x5740;
-const DEVICE_USAGE: &str = "usage: pd device list | pd device -d <serial> eject";
+const DEVICE_USAGE: &str = "usage: pd device list | pd device -d <serial> eject | pd device -d <serial> mount | pd device -d <serial> datadisk | pd device -d <serial> serial <command>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Device {
@@ -27,6 +30,7 @@ struct MountEntry {
 enum DeviceCommand {
     List,
     Eject { device_id: String },
+    Serial { device_id: String, command: String },
 }
 
 fn main() {
@@ -57,6 +61,11 @@ fn run_device_command(args: &[String]) -> Result<(), String> {
             println!("ejected {serial}");
             Ok(())
         }
+        DeviceCommand::Serial { device_id, command } => {
+            let (serial, port) = send_serial_command_to_device(&device_id, &command)?;
+            println!("sent '{command}' to {serial} on {port}");
+            Ok(())
+        }
     }
 }
 
@@ -79,8 +88,124 @@ fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
                 device_id: device_id.clone(),
             })
         }
+        [flag, device_id, command]
+            if (flag == "-d" || flag == "--device")
+                && (command == "mount" || command == "datadisk") =>
+        {
+            Ok(DeviceCommand::Serial {
+                device_id: device_id.clone(),
+                command: "datadisk".to_string(),
+            })
+        }
+        [command, flag, device_id]
+            if (command == "mount" || command == "datadisk")
+                && (flag == "-d" || flag == "--device") =>
+        {
+            Ok(DeviceCommand::Serial {
+                device_id: device_id.clone(),
+                command: "datadisk".to_string(),
+            })
+        }
+        [flag, device_id, serial_keyword, command]
+            if (flag == "-d" || flag == "--device") && serial_keyword == "serial" =>
+        {
+            Ok(DeviceCommand::Serial {
+                device_id: device_id.clone(),
+                command: command.clone(),
+            })
+        }
+        [serial_keyword, flag, device_id, command]
+            if serial_keyword == "serial" && (flag == "-d" || flag == "--device") =>
+        {
+            Ok(DeviceCommand::Serial {
+                device_id: device_id.clone(),
+                command: command.clone(),
+            })
+        }
         _ => Err(DEVICE_USAGE.to_string()),
     }
+}
+
+fn send_serial_command_to_device(
+    device_id: &str,
+    command: &str,
+) -> Result<(String, String), String> {
+    let devices = list_devices()?;
+    let needle = normalize(device_id);
+
+    let device = devices
+        .into_iter()
+        .find(|d| normalize(&d.device) == needle)
+        .ok_or_else(|| {
+            format!("device '{device_id}' not found; run `pd device list` to see available devices")
+        })?;
+
+    if device.port.is_empty() {
+        return Err(format!(
+            "device '{}' has no serial port available; reconnect in serial mode and try again",
+            device.device
+        ));
+    }
+
+    send_serial_command(&device.port, command)?;
+    Ok((device.device, device.port))
+}
+
+fn send_serial_command(port_path: &str, command: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut port = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port_path)
+            .map_err(|e| format!("failed to open serial port '{port_path}': {e}"))?;
+
+        configure_serial_port_8n1_115200(port.as_raw_fd())
+            .map_err(|e| format!("failed to configure serial port '{port_path}': {e}"))?;
+
+        let payload = format!("{command}\n");
+        port.write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write command to '{port_path}': {e}"))?;
+        port.flush()
+            .map_err(|e| format!("failed to flush command to '{port_path}': {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (port_path, command);
+        Err("serial command is not supported on this platform yet".to_string())
+    }
+}
+
+#[cfg(unix)]
+fn configure_serial_port_8n1_115200(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+    let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+
+    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if unsafe { libc::cfsetispeed(&mut term, libc::B115200) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::cfsetospeed(&mut term, libc::B115200) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag &= !(libc::PARENB | libc::CSTOPB | libc::CSIZE | libc::CRTSCTS);
+    term.c_cflag |= libc::CS8 | libc::CLOCAL | libc::CREAD;
+    term.c_cc[libc::VMIN] = 0;
+    term.c_cc[libc::VTIME] = 1;
+
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn eject_device(device_id: &str) -> Result<String, String> {
@@ -681,5 +806,42 @@ mod tests {
         assert!(is_playdate_product_id(0x5740));
         assert!(is_playdate_product_id(0x5741));
         assert!(!is_playdate_product_id(0x5742));
+    }
+
+    #[test]
+    fn parses_device_mount_alias_command() {
+        let args = vec![
+            "-d".to_string(),
+            "PDU1-Y013705".to_string(),
+            "mount".to_string(),
+        ];
+
+        let cmd = parse_device_command(&args).expect("expected serial datadisk command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Serial {
+                device_id: "PDU1-Y013705".to_string(),
+                command: "datadisk".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_device_serial_command() {
+        let args = vec![
+            "-d".to_string(),
+            "PDU1-Y013705".to_string(),
+            "serial".to_string(),
+            "help".to_string(),
+        ];
+
+        let cmd = parse_device_command(&args).expect("expected serial command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Serial {
+                device_id: "PDU1-Y013705".to_string(),
+                command: "help".to_string()
+            }
+        );
     }
 }

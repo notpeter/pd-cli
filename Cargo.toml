@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 nusb = "0.2"
+libc = "0.2"
