@@ -4,7 +4,8 @@ use std::env;
 use std::process::Command;
 
 const PLAYDATE_VENDOR_ID: u16 = 0x1331;
-const PLAYDATE_PRODUCT_ID: u16 = 0x5741;
+const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
+const PLAYDATE_PRODUCT_ID_APP: u16 = 0x5740;
 const DEVICE_USAGE: &str = "usage: pd device list | pd device -d <serial> eject";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +166,7 @@ fn list_devices() -> Result<Vec<Device>, String> {
         .map_err(|e| format!("failed to list USB devices: {e}"))?;
 
     for usb in usb_devices {
-        if usb.vendor_id() != PLAYDATE_VENDOR_ID || usb.product_id() != PLAYDATE_PRODUCT_ID {
+        if !is_playdate_usb_device(usb.vendor_id(), usb.product_id()) {
             continue;
         }
 
@@ -381,7 +382,7 @@ fn parse_macos_playdate_disks_by_serial(input: &str) -> HashMap<String, Vec<Stri
 
         if line.contains("\"idProduct\" =") {
             if let Some(v) = parse_ioreg_u16_value(line) {
-                saw_product = v == PLAYDATE_PRODUCT_ID;
+                saw_product = is_playdate_product_id(v);
             }
             continue;
         }
@@ -464,6 +465,14 @@ fn find_port_for_serial(serial: &str, ports: &[String]) -> Option<String> {
         .cloned()
 }
 
+fn is_playdate_usb_device(vendor_id: u16, product_id: u16) -> bool {
+    vendor_id == PLAYDATE_VENDOR_ID && is_playdate_product_id(product_id)
+}
+
+fn is_playdate_product_id(product_id: u16) -> bool {
+    product_id == PLAYDATE_PRODUCT_ID_MSC || product_id == PLAYDATE_PRODUCT_ID_APP
+}
+
 fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -519,7 +528,7 @@ fn print_devices(devices: &[Device]) {
 mod tests {
     use super::{
         build_disk_mount_index, extract_disk_from_device_path, find_mount_path_for_serial,
-        find_port_for_serial, normalize, parse_device_command,
+        find_port_for_serial, is_playdate_product_id, normalize, parse_device_command,
         parse_macos_playdate_disks_by_serial, parse_mount_entries, DeviceCommand, MountEntry,
     };
     use std::collections::HashMap;
@@ -665,5 +674,12 @@ mod tests {
                 device_id: "PDU1-Y013705".to_string()
             }
         );
+    }
+
+    #[test]
+    fn recognizes_both_playdate_product_ids() {
+        assert!(is_playdate_product_id(0x5740));
+        assert!(is_playdate_product_id(0x5741));
+        assert!(!is_playdate_product_id(0x5742));
     }
 }
