@@ -5,6 +5,7 @@ use std::process::Command;
 
 const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 const PLAYDATE_PRODUCT_ID: u16 = 0x5741;
+const DEVICE_USAGE: &str = "usage: pd device list | pd device -d <serial> eject";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Device {
@@ -12,12 +13,19 @@ struct Device {
     port: String,
     mounted: bool,
     mount_path: String,
+    disk: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountEntry {
     source: String,
     target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeviceCommand {
+    List,
+    Eject { device_id: String },
 }
 
 fn main() {
@@ -31,16 +39,110 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
     match args.get(1).map(String::as_str) {
-        Some("device") => match args.get(2).map(String::as_str) {
-            Some("list") => {
-                let devices = list_devices()?;
-                print_devices(&devices);
-                Ok(())
-            }
-            _ => Err("usage: pd device list".to_string()),
-        },
-        _ => Err("usage: pd device list".to_string()),
+        Some("device") => run_device_command(&args[2..]),
+        _ => Err(DEVICE_USAGE.to_string()),
     }
+}
+
+fn run_device_command(args: &[String]) -> Result<(), String> {
+    match parse_device_command(args)? {
+        DeviceCommand::List => {
+            let devices = list_devices()?;
+            print_devices(&devices);
+            Ok(())
+        }
+        DeviceCommand::Eject { device_id } => {
+            let serial = eject_device(&device_id)?;
+            println!("ejected {serial}");
+            Ok(())
+        }
+    }
+}
+
+fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
+    match args {
+        [command] if command == "list" => Ok(DeviceCommand::List),
+        [flag, device_id, command]
+            if (flag == "-d" || flag == "--device")
+                && (command == "eject" || command == "unmount") =>
+        {
+            Ok(DeviceCommand::Eject {
+                device_id: device_id.clone(),
+            })
+        }
+        [command, flag, device_id]
+            if (command == "eject" || command == "unmount")
+                && (flag == "-d" || flag == "--device") =>
+        {
+            Ok(DeviceCommand::Eject {
+                device_id: device_id.clone(),
+            })
+        }
+        _ => Err(DEVICE_USAGE.to_string()),
+    }
+}
+
+fn eject_device(device_id: &str) -> Result<String, String> {
+    let devices = list_devices()?;
+    let needle = normalize(device_id);
+
+    let device = devices
+        .into_iter()
+        .find(|d| normalize(&d.device) == needle)
+        .ok_or_else(|| {
+            format!("device '{device_id}' not found; run `pd device list` to see available devices")
+        })?;
+
+    eject_target(&device.disk, &device.mount_path)?;
+    Ok(device.device)
+}
+
+#[cfg(target_os = "macos")]
+fn eject_target(disk: &str, mount_path: &str) -> Result<(), String> {
+    let target = if !disk.is_empty() {
+        format!("/dev/{disk}")
+    } else if !mount_path.is_empty() {
+        mount_path.to_string()
+    } else {
+        return Err("device has no known disk or mount path to eject".to_string());
+    };
+
+    let output = Command::new("diskutil")
+        .args(["eject", &target])
+        .output()
+        .map_err(|e| format!("failed to run diskutil: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!("failed to eject '{target}': {stdout}{stderr}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn eject_target(_disk: &str, mount_path: &str) -> Result<(), String> {
+    if mount_path.is_empty() {
+        return Err("device is not mounted; cannot eject on this platform".to_string());
+    }
+
+    let output = Command::new("umount")
+        .arg(mount_path)
+        .output()
+        .map_err(|e| format!("failed to run umount: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("failed to unmount '{mount_path}': {stderr}"))
+}
+
+#[cfg(not(unix))]
+fn eject_target(_disk: &str, _mount_path: &str) -> Result<(), String> {
+    Err("eject is not supported on this platform yet".to_string())
 }
 
 fn list_devices() -> Result<Vec<Device>, String> {
@@ -68,6 +170,10 @@ fn list_devices() -> Result<Vec<Device>, String> {
         }
 
         let serial = usb.serial_number().unwrap_or("unknown").to_string();
+        let disk = serial_to_disks
+            .get(&normalize(&serial))
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_default();
         let port = find_port_for_serial(&serial, &serial_ports).unwrap_or_default();
         let mount_path = find_mount_path_for_serial(&serial, &serial_to_disks, &disk_mounts)
             .or_else(|| {
@@ -84,6 +190,7 @@ fn list_devices() -> Result<Vec<Device>, String> {
             port,
             mounted: !mount_path.is_empty(),
             mount_path,
+            disk,
         });
     }
 
@@ -179,12 +286,7 @@ fn build_disk_mount_index(mounts: &[MountEntry]) -> HashMap<String, String> {
 
 fn extract_disk_from_device_path(path: &str) -> Option<String> {
     let name = path.strip_prefix("/dev/")?;
-    if !name.starts_with("disk") {
-        return None;
-    }
-
-    let whole = name.split('s').next().unwrap_or(name);
-    Some(whole.to_string())
+    extract_disk_name(name)
 }
 
 fn find_any_playdate_mount(mounts: &[MountEntry]) -> Option<String> {
@@ -270,12 +372,6 @@ fn parse_macos_playdate_disks_by_serial(input: &str) -> HashMap<String, Vec<Stri
             continue;
         }
 
-        if line.starts_with('}') {
-            finalize(&mut result, saw_vendor, saw_product, &serial, &disks);
-            in_playdate = false;
-            continue;
-        }
-
         if line.contains("\"idVendor\" =") {
             if let Some(v) = parse_ioreg_u16_value(line) {
                 saw_vendor = v == PLAYDATE_VENDOR_ID;
@@ -350,8 +446,13 @@ fn extract_disk_name(name: &str) -> Option<String> {
         return None;
     }
 
-    let whole = name.split('s').next().unwrap_or(name);
-    Some(whole.to_string())
+    let suffix = &name["disk".len()..];
+    let digits: String = suffix.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    Some(format!("disk{digits}"))
 }
 
 fn find_port_for_serial(serial: &str, ports: &[String]) -> Option<String> {
@@ -418,8 +519,8 @@ fn print_devices(devices: &[Device]) {
 mod tests {
     use super::{
         build_disk_mount_index, extract_disk_from_device_path, find_mount_path_for_serial,
-        find_port_for_serial, normalize, parse_macos_playdate_disks_by_serial, parse_mount_entries,
-        MountEntry,
+        find_port_for_serial, normalize, parse_device_command,
+        parse_macos_playdate_disks_by_serial, parse_mount_entries, DeviceCommand, MountEntry,
     };
     use std::collections::HashMap;
 
@@ -523,5 +624,46 @@ mod tests {
         let path = find_mount_path_for_serial("PDU1-Y013705", &serial_to_disks, &index);
 
         assert_eq!(path.as_deref(), Some("/Volumes/PLAYDATE"));
+    }
+
+    #[test]
+    fn parses_device_list_command() {
+        let args = vec!["list".to_string()];
+        let cmd = parse_device_command(&args).expect("expected list command");
+        assert_eq!(cmd, DeviceCommand::List);
+    }
+
+    #[test]
+    fn parses_device_unmount_command_with_flag_first() {
+        let args = vec![
+            "-d".to_string(),
+            "PDU1-Y013705".to_string(),
+            "unmount".to_string(),
+        ];
+
+        let cmd = parse_device_command(&args).expect("expected eject command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Eject {
+                device_id: "PDU1-Y013705".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_device_eject_command_with_subcommand_first() {
+        let args = vec![
+            "eject".to_string(),
+            "--device".to_string(),
+            "PDU1-Y013705".to_string(),
+        ];
+
+        let cmd = parse_device_command(&args).expect("expected eject command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Eject {
+                device_id: "PDU1-Y013705".to_string()
+            }
+        );
     }
 }
