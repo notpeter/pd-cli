@@ -8,3 +8,4 @@ name = "pd"
 path = "src/main.rs"
 
 [dependencies]
+nusb = "0.2"
