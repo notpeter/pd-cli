@@ -19,7 +19,7 @@ const SCREEN_WIDTH: u32 = 400;
 const SCREEN_HEIGHT: u32 = 240;
 const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
-const DEVICE_USAGE: &str = "usage: pd device list | pd device [-d <serial>] eject | pd device [-d <serial>] mount | pd device [-d <serial>] datadisk | pd device [-d <serial>] serial <command> | pd device [-d <serial>] screenshot [-f <filename>] [--open]";
+const DEVICE_USAGE: &str = "usage: pd device list | pd device [-d <serial>] eject | pd device [-d <serial>] mount | pd device [-d <serial>] datadisk | pd device [-d <serial>] serial <command> | pd device [-d <serial>] stats [--json] | pd device [-d <serial>] screenshot [-f <filename>] [--open]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Device {
@@ -50,6 +50,10 @@ enum DeviceCommand {
         device_id: Option<String>,
         filename: Option<String>,
         open: bool,
+    },
+    Stats {
+        device_id: Option<String>,
+        json: bool,
     },
 }
 
@@ -98,6 +102,21 @@ fn run_device_command(args: &[String]) -> Result<(), String> {
             if open {
                 open_with_default_viewer(&path)?;
                 println!("opened {path}");
+            }
+            Ok(())
+        }
+        DeviceCommand::Stats { device_id, json } => {
+            let (serial, entries, raw) = fetch_stats(device_id.as_deref())?;
+            if json {
+                print_stats_json(&entries);
+            } else if entries.is_empty() {
+                println!("stats from {serial}");
+                println!("{}", raw.trim());
+            } else {
+                println!("stats from {serial}");
+                for (k, v) in entries {
+                    println!("{k}: {v}");
+                }
             }
             Ok(())
         }
@@ -168,9 +187,47 @@ fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
             device_id: None,
             command: command.clone(),
         }),
+        _ if args.iter().any(|arg| arg == "stats") => parse_stats_command(args),
         _ if args.iter().any(|arg| arg == "screenshot") => parse_screenshot_command(args),
         _ => Err(DEVICE_USAGE.to_string()),
     }
+}
+
+fn parse_stats_command(args: &[String]) -> Result<DeviceCommand, String> {
+    let stats_count = args.iter().filter(|arg| arg.as_str() == "stats").count();
+    if stats_count != 1 {
+        return Err(DEVICE_USAGE.to_string());
+    }
+
+    let mut device_id: Option<String> = None;
+    let mut json = false;
+    let mut saw_stats = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "stats" => {
+                saw_stats = true;
+                i += 1;
+            }
+            "-d" | "--device" => {
+                let value = args.get(i + 1).ok_or_else(|| DEVICE_USAGE.to_string())?;
+                device_id = Some(value.clone());
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            _ => return Err(DEVICE_USAGE.to_string()),
+        }
+    }
+
+    if !saw_stats {
+        return Err(DEVICE_USAGE.to_string());
+    }
+
+    Ok(DeviceCommand::Stats { device_id, json })
 }
 
 fn parse_screenshot_command(args: &[String]) -> Result<DeviceCommand, String> {
@@ -359,6 +416,23 @@ fn send_serial_command_to_device(
     Ok((device.device, device.port))
 }
 
+fn fetch_stats(device_id: Option<&str>) -> Result<(String, Vec<(String, String)>, String), String> {
+    let devices = list_devices()?;
+    let device = resolve_device(devices, device_id)?;
+
+    if device.port.is_empty() {
+        return Err(format!(
+            "device '{}' has no serial port available; reconnect in serial mode and try again",
+            device.device
+        ));
+    }
+
+    let payload = send_serial_command_and_capture(&device.port, "stats")?;
+    let raw = String::from_utf8_lossy(&payload).to_string();
+    let entries = parse_stats_entries(&raw);
+    Ok((device.device, entries, raw))
+}
+
 fn send_serial_command(port_path: &str, command: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -536,6 +610,71 @@ fn screenshot_kind_for_path(path: &str) -> &'static str {
         Ok(Some(ImageFormat::Gif)) => "GIF image",
         _ => "raw serial bytes",
     }
+}
+
+fn parse_stats_entries(raw: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let normalized = raw.replace('\r', "\n");
+    let mut in_stats = false;
+
+    for line in normalized.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains("~stats:") {
+            in_stats = true;
+            continue;
+        }
+        if !in_stats {
+            continue;
+        }
+        if line.starts_with('~') {
+            break;
+        }
+
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            let value = v.trim();
+            if !key.is_empty() && !value.is_empty() {
+                entries.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+
+    entries
+}
+
+fn print_stats_json(entries: &[(String, String)]) {
+    println!("{{");
+    for (idx, (k, v)) in entries.iter().enumerate() {
+        let comma = if idx + 1 < entries.len() { "," } else { "" };
+        if let Ok(i) = v.parse::<i64>() {
+            println!("  \"{}\": {}{}", escape_json(k), i, comma);
+            continue;
+        }
+        if let Ok(f) = v.parse::<f64>() {
+            if f.is_finite() {
+                println!("  \"{}\": {}{}", escape_json(k), f, comma);
+                continue;
+            }
+        }
+        println!("  \"{}\": \"{}\"{}", escape_json(k), escape_json(v), comma);
+    }
+    println!("}}");
+}
+
+fn escape_json(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
 }
 
 fn open_with_default_viewer(path: &str) -> Result<(), String> {
@@ -1047,8 +1186,8 @@ mod tests {
         build_disk_mount_index, extract_disk_from_device_path, extract_screen_bitmap,
         find_mount_path_for_serial, find_port_for_serial, is_playdate_product_id, normalize,
         parse_device_command, parse_macos_playdate_disks_by_serial, parse_mount_entries,
-        resolve_device, screenshot_format_for_path, Device, DeviceCommand, MountEntry,
-        SCREEN_BITMAP_BYTES, SCREEN_PREFIX,
+        parse_stats_entries, resolve_device, screenshot_format_for_path, Device, DeviceCommand,
+        MountEntry, SCREEN_BITMAP_BYTES, SCREEN_PREFIX,
     };
     use image::ImageFormat;
     use std::collections::HashMap;
@@ -1427,5 +1566,49 @@ mod tests {
         let bitmap = extract_screen_bitmap(&payload).expect("bitmap extraction");
         assert_eq!(bitmap.len(), SCREEN_BITMAP_BYTES);
         assert_eq!(bitmap[0], 0xAA);
+    }
+
+    #[test]
+    fn parses_stats_command_with_json() {
+        let args = vec!["stats".to_string(), "--json".to_string()];
+        let cmd = parse_device_command(&args).expect("expected stats command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Stats {
+                device_id: None,
+                json: true
+            }
+        );
+    }
+
+    #[test]
+    fn parses_stats_command_with_device() {
+        let args = vec![
+            "-d".to_string(),
+            "PDU1-Y013705".to_string(),
+            "stats".to_string(),
+        ];
+        let cmd = parse_device_command(&args).expect("expected stats command");
+        assert_eq!(
+            cmd,
+            DeviceCommand::Stats {
+                device_id: Some("PDU1-Y013705".to_string()),
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_stats_payload_entries() {
+        let raw = "stats\r\n~stats:\nframe count: 194503\nframe time: 0.000977\nkernel: 0.1%\n";
+        let entries = parse_stats_entries(raw);
+        assert_eq!(
+            entries,
+            vec![
+                ("frame count".to_string(), "194503".to_string()),
+                ("frame time".to_string(), "0.000977".to_string()),
+                ("kernel".to_string(), "0.1%".to_string()),
+            ]
+        );
     }
 }

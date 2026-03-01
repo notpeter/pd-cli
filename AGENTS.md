@@ -10,6 +10,11 @@
 - `cargo test`: Run unit tests in `src/main.rs`.
 - `cargo fmt`: Format Rust code; run before committing.
 
+## Running
+
+Some commands may require a connected playdate device to work.
+If there is no device available, prompt the user to connect/unlock the device as it may have gone to sleep.
+
 ## Coding Style & Naming Conventions
 
 - Follow Rust 2024 idioms and keep code `rustfmt`-clean.
