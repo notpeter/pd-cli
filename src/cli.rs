@@ -1,4 +1,16 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogFormat {
+    Text,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedCli {
+    pub(crate) command: DeviceCommand,
+    pub(crate) log_format: LogFormat,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeviceCommand {
@@ -31,6 +43,8 @@ pub(crate) enum DeviceCommand {
 #[derive(Debug, Parser)]
 #[command(name = "pd")]
 struct Cli {
+    #[arg(long = "log-format", value_enum, default_value = "text", global = true)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: TopLevelCommand,
 }
@@ -74,16 +88,16 @@ enum DeviceSubcommand {
     Hibernate,
 }
 
-pub(crate) fn parse_cli_from_env() -> Result<DeviceCommand, String> {
+pub(crate) fn parse_cli_from_env() -> Result<ParsedCli, String> {
     let parsed = Cli::try_parse().map_err(|e| e.to_string())?;
-    Ok(map_parsed_device_command(parsed))
+    Ok(map_parsed_cli(parsed))
 }
 
-fn map_parsed_device_command(parsed: Cli) -> DeviceCommand {
+fn map_parsed_cli(parsed: Cli) -> ParsedCli {
     match parsed.command {
         TopLevelCommand::Device(device_cli) => {
             let DeviceCli { device_id, command } = device_cli;
-            match command {
+            let command = match command {
                 DeviceSubcommand::List => DeviceCommand::List,
                 DeviceSubcommand::Eject => DeviceCommand::Eject { device_id },
                 DeviceSubcommand::Mount { open } => DeviceCommand::Mount { device_id, open },
@@ -101,6 +115,10 @@ fn map_parsed_device_command(parsed: Cli) -> DeviceCommand {
                     open,
                 },
                 DeviceSubcommand::Hibernate => DeviceCommand::Hibernate { device_id },
+            };
+            ParsedCli {
+                command,
+                log_format: parsed.log_format,
             }
         }
     }
@@ -108,7 +126,7 @@ fn map_parsed_device_command(parsed: Cli) -> DeviceCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, DeviceCommand, map_parsed_device_command};
+    use super::{Cli, DeviceCommand, LogFormat, ParsedCli, map_parsed_cli};
     use clap::Parser;
 
     #[test]
@@ -116,11 +134,22 @@ mod tests {
         let parsed = Cli::try_parse_from(["pd", "device", "-d", "PDU1-Y012345", "mount", "--open"])
             .expect("mount parse should succeed");
         assert_eq!(
-            map_parsed_device_command(parsed),
-            DeviceCommand::Mount {
-                device_id: Some("PDU1-Y012345".to_string()),
-                open: true
+            map_parsed_cli(parsed),
+            ParsedCli {
+                command: DeviceCommand::Mount {
+                    device_id: Some("PDU1-Y012345".to_string()),
+                    open: true
+                },
+                log_format: LogFormat::Text
             }
         );
+    }
+
+    #[test]
+    fn parses_jsonl_log_format() {
+        let parsed = Cli::try_parse_from(["pd", "--log-format", "jsonl", "device", "list"])
+            .expect("parse should succeed");
+        let parsed = map_parsed_cli(parsed);
+        assert_eq!(parsed.log_format, LogFormat::Jsonl);
     }
 }

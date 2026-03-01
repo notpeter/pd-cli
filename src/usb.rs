@@ -40,7 +40,7 @@ pub(crate) fn resolve_device(
     }
 }
 
-pub(crate) fn resolve_selected_device(device: &DeviceSelector) -> Result<Device, String> {
+pub(crate) fn get_device(device: &DeviceSelector) -> Result<Device, String> {
     let devices = DeviceList::discover()?;
     resolve_device(devices, device)
 }
@@ -77,14 +77,14 @@ pub(crate) fn resolve_mount_target(device: &DeviceSelector) -> Result<Device, St
 }
 
 impl Device {
-    pub(crate) fn send_command(&self, command: &str) -> Result<(String, String), String> {
+    pub(crate) fn send_command(&self, command: &str) -> Result<(), String> {
         let Some(port) = self.port() else {
             return Err(format!(
                 "{self} has no serial port available; is the disk mounted?"
             ));
         };
         port.send_serial_command(command)?;
-        Ok((self.serial().to_string(), port.to_string()))
+        Ok(())
     }
 
     pub(crate) fn wait_for_mount_ready(&self) -> Result<String, String> {

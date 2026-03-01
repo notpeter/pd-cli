@@ -1,4 +1,6 @@
-use crate::cli::{DeviceCommand as CliDeviceCommand, parse_cli_from_env};
+use crate::cli::{
+    DeviceCommand as CliDeviceCommand, LogFormat as CliLogFormat, parse_cli_from_env,
+};
 use crate::device::DeviceSerial;
 use std::path::PathBuf;
 
@@ -54,9 +56,32 @@ pub(crate) enum Command {
     },
 }
 
-pub(crate) fn parse_command_from_env() -> Result<Command, String> {
-    let cli_command = parse_cli_from_env()?;
-    map_parsed_command(cli_command)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFormat {
+    Text,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedCommand {
+    pub(crate) command: Command,
+    pub(crate) log_format: LogFormat,
+}
+
+pub(crate) fn parse_command_from_env() -> Result<ParsedCommand, String> {
+    let parsed = parse_cli_from_env()?;
+    Ok(ParsedCommand {
+        command: map_parsed_command(parsed.command)?,
+        log_format: map_log_format(parsed.log_format),
+    })
+}
+
+fn map_log_format(format: CliLogFormat) -> LogFormat {
+    // TODO: Make this --json / --text not `--log-format {jsonl,text}`
+    match format {
+        CliLogFormat::Text => LogFormat::Text,
+        CliLogFormat::Jsonl => LogFormat::Jsonl,
+    }
 }
 
 fn map_parsed_command(command: CliDeviceCommand) -> Result<Command, String> {

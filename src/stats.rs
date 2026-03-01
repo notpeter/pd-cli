@@ -1,29 +1,33 @@
 use crate::device::Device;
 use serde_json::{Map, Number, Value};
 
-pub(crate) fn fetch_stats(device: &Device) -> Result<(String, Vec<(String, String)>), String> {
-    let Some(port) = device.port() else {
-        return Err(format!(
-            "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.serial()
-        ));
-    };
+impl Device {
+    pub(crate) fn fetch_stats(&self) -> Result<Vec<(String, String)>, String> {
+        // TODO: Make this return a structured object of values (string|integer|float)
+        let Some(port) = self.port() else {
+            return Err(format!(
+                "device '{}' has no serial port available; reconnect in serial mode and try again",
+                self.serial()
+            ));
+        };
 
-    let payload = port.send_serial_command_and_capture("stats")?;
-    let raw = String::from_utf8_lossy(&payload).to_string();
-    let mut entries = parse_stats_entries(&raw)
-        .into_iter()
-        .map(|(k, v)| normalize_stat(&k, &v))
-        .collect::<Vec<_>>();
+        let payload = port.send_serial_command_and_capture("stats")?;
+        let raw = String::from_utf8_lossy(&payload).to_string();
+        let mut entries = parse_stats_entries(&raw)
+            .into_iter()
+            .map(|(k, v)| normalize_stat(&k, &v))
+            .collect::<Vec<_>>();
 
-    for command in ["vbat", "batpct", "temp", "gettime"] {
-        let raw_value = query_metric(port, command).unwrap_or_else(|| "unavailable".to_string());
-        for (key, value) in metric_output_entries(command, &raw_value) {
-            entries.push((key, value));
+        for command in ["vbat", "batpct", "temp", "gettime"] {
+            let raw_value =
+                query_metric(port, command).unwrap_or_else(|| "unavailable".to_string());
+            for (key, value) in metric_output_entries(command, &raw_value) {
+                entries.push((key, value));
+            }
         }
-    }
 
-    Ok((device.serial().to_string(), entries))
+        Ok(entries)
+    }
 }
 
 fn query_metric(port: &crate::platform::SerialPortPath, command: &str) -> Option<String> {

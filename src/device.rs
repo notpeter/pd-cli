@@ -1,4 +1,5 @@
 use crate::platform::SerialPortPath;
+use serde_json::json;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,23 @@ pub(crate) struct Device {
     mount_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceLog {
+    pub(crate) serial_number: String,
+    pub(crate) msg: String,
+}
+
+impl DeviceLog {
+    #[allow(dead_code)]
+    pub(crate) fn to_jsonl(&self) -> String {
+        json!({
+            "serial_number": self.serial_number,
+            "msg": self.msg,
+        })
+        .to_string()
+    }
+}
+
 impl Device {
     pub(crate) fn new(
         serial: DeviceSerial,
@@ -83,11 +101,24 @@ impl Device {
     pub(crate) fn clear_mount_path(&mut self) {
         self.mount_path = None;
     }
+
+    pub(crate) fn log(&self, msg: impl Into<String>) -> DeviceLog {
+        DeviceLog {
+            serial_number: self.serial().to_string(),
+            msg: msg.into(),
+        }
+    }
 }
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.serial)
+    }
+}
+
+impl fmt::Display for DeviceLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.serial_number, self.msg)
     }
 }
 
@@ -154,5 +185,27 @@ impl fmt::Display for DeviceList {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Device, DeviceSerial};
+
+    #[test]
+    fn device_log_displays_with_serial_prefix() {
+        let device = Device::new(DeviceSerial::parse("Y012345").unwrap(), None, None);
+        let log = device.log("Ejected device");
+        assert_eq!(log.to_string(), "PDU1-Y012345: Ejected device");
+    }
+
+    #[test]
+    fn device_log_renders_jsonl() {
+        let device = Device::new(DeviceSerial::parse("Y012345").unwrap(), None, None);
+        let log = device.log("Sent serial command: hibernate");
+        assert_eq!(
+            log.to_jsonl(),
+            r#"{"msg":"Sent serial command: hibernate","serial_number":"PDU1-Y012345"}"#
+        );
     }
 }
