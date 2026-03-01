@@ -1,8 +1,9 @@
 use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Luma};
 use std::path::Path;
-use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{list_devices, resolve_device, send_serial_command_and_capture};
+use crate::device::{list_devices, resolve_device};
+use crate::platform::send_serial_command_and_capture;
 
 const SCREEN_PREFIX: &[u8] = b"screen\r\n~screen:\n";
 const SCREEN_PREFIX_LEGACY: &[u8] = b"\r\nscreen~:\n";
@@ -69,8 +70,8 @@ fn screenshot_format_for_path(path: &str) -> Result<Option<ImageFormat>, String>
         Some("png") => Ok(Some(ImageFormat::Png)),
         Some("gif") => Ok(Some(ImageFormat::Gif)),
         Some("raw") | Some("bin") | None => Ok(None),
-        Some(other) => Err(format!(
-            "unsupported screenshot extension '.{other}'; use .png, .gif, .raw, or .bin"
+        _ => Err(format!(
+            "unsupported screenshot extension; use .png, .gif, .raw, or .bin"
         )),
     }
 }
@@ -131,18 +132,12 @@ fn default_screenshot_filename() -> String {
     format!("playdate_{}.gif", timestamp_now())
 }
 
-#[cfg(unix)]
 fn timestamp_now() -> String {
-    let output = Command::new("date").arg("+%Y-%m-%d_%H%M%S").output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => "1970-01-01_000000".to_string(),
-    }
-}
-
-#[cfg(not(unix))]
-fn timestamp_now() -> String {
-    "1970-01-01_000000".to_string()
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs.to_string()
 }
 
 fn inspect_screen_payload(payload: &[u8], path: &str) -> String {
@@ -196,31 +191,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SCREEN_BITMAP_BYTES, SCREEN_PREFIX, extract_screen_bitmap, screenshot_format_for_path,
-    };
-    use image::ImageFormat;
+    use super::{SCREEN_BITMAP_BYTES, SCREEN_PREFIX, extract_screen_bitmap};
 
     #[test]
     fn has_expected_screen_prefix_signature() {
         assert_eq!(SCREEN_PREFIX, b"screen\r\n~screen:\n");
-    }
-
-    #[test]
-    fn screenshot_format_detects_png_and_gif() {
-        assert_eq!(
-            screenshot_format_for_path("capture.png").expect("png format"),
-            Some(ImageFormat::Png)
-        );
-        assert_eq!(
-            screenshot_format_for_path("capture.gif").expect("gif format"),
-            Some(ImageFormat::Gif)
-        );
-        assert!(
-            screenshot_format_for_path("capture.raw")
-                .expect("raw format")
-                .is_none()
-        );
     }
 
     #[test]

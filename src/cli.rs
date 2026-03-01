@@ -12,6 +12,7 @@ pub(crate) enum DeviceCommand {
     },
     Mount {
         device_id: Option<String>,
+        open: bool,
     },
     Screenshot {
         device_id: Option<String>,
@@ -52,7 +53,10 @@ enum DeviceSubcommand {
     List,
     #[command(alias = "unmount")]
     Eject,
-    Mount,
+    Mount {
+        #[arg(long = "open")]
+        open: bool,
+    },
     Datadisk,
     Serial {
         command: String,
@@ -82,7 +86,7 @@ fn map_parsed_device_command(parsed: Cli) -> DeviceCommand {
             match command {
                 DeviceSubcommand::List => DeviceCommand::List,
                 DeviceSubcommand::Eject => DeviceCommand::Eject { device_id },
-                DeviceSubcommand::Mount => DeviceCommand::Mount { device_id },
+                DeviceSubcommand::Mount { open } => DeviceCommand::Mount { device_id, open },
                 DeviceSubcommand::Datadisk => DeviceCommand::Serial {
                     device_id,
                     command: "datadisk".to_string(),
@@ -99,5 +103,24 @@ fn map_parsed_device_command(parsed: Cli) -> DeviceCommand {
                 DeviceSubcommand::Hibernate => DeviceCommand::Hibernate { device_id },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, DeviceCommand, map_parsed_device_command};
+    use clap::Parser;
+
+    #[test]
+    fn parses_mount_with_open_flag() {
+        let parsed = Cli::try_parse_from(["pd", "device", "-d", "PDU1-Y013705", "mount", "--open"])
+            .expect("mount parse should succeed");
+        assert_eq!(
+            map_parsed_device_command(parsed),
+            DeviceCommand::Mount {
+                device_id: Some("PDU1-Y013705".to_string()),
+                open: true
+            }
+        );
     }
 }

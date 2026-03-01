@@ -1,4 +1,5 @@
-use crate::{list_devices, query_metric, resolve_device, send_serial_command_and_capture};
+use crate::device::{list_devices, resolve_device};
+use crate::platform::send_serial_command_and_capture;
 
 pub(crate) fn fetch_stats(
     device_id: Option<&str>,
@@ -29,6 +30,12 @@ pub(crate) fn fetch_stats(
     }
 
     Ok((device.device, entries))
+}
+
+fn query_metric(port_path: &str, command: &str) -> Option<String> {
+    let payload = send_serial_command_and_capture(port_path, command).ok()?;
+    let raw = String::from_utf8_lossy(&payload);
+    parse_metric_value(command, &raw)
 }
 
 pub(crate) fn parse_stats_entries(raw: &str) -> Vec<(String, String)> {
