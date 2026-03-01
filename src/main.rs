@@ -1,7 +1,9 @@
+mod cli;
+
+use crate::cli::{DeviceCommand, parse_cli_from_env};
 use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Luma};
 use nusb::MaybeFuture;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -21,7 +23,6 @@ const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
 const MOUNT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const MOUNT_WAIT_POLL: Duration = Duration::from_millis(250);
-const DEVICE_USAGE: &str = "usage: pd device list | pd device [-d <serial>] eject | pd device [-d <serial>] hibernate | pd device [-d <serial>] mount | pd device [-d <serial>] datadisk | pd device [-d <serial>] serial <command> | pd device [-d <serial>] stats [--json] | pd device [-d <serial>] screenshot [-f <filename>] [--open]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Device {
@@ -38,33 +39,6 @@ struct MountEntry {
     target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DeviceCommand {
-    List,
-    Eject {
-        device_id: Option<String>,
-    },
-    Serial {
-        device_id: Option<String>,
-        command: String,
-    },
-    Mount {
-        device_id: Option<String>,
-    },
-    Screenshot {
-        device_id: Option<String>,
-        filename: Option<String>,
-        open: bool,
-    },
-    Stats {
-        device_id: Option<String>,
-        json: bool,
-    },
-    Hibernate {
-        device_id: Option<String>,
-    },
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -73,16 +47,12 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = env::args().collect();
-
-    match args.get(1).map(String::as_str) {
-        Some("device") => run_device_command(&args[2..]),
-        _ => Err(DEVICE_USAGE.to_string()),
-    }
+    let command = parse_cli_from_env()?;
+    run_device_command(command)
 }
 
-fn run_device_command(args: &[String]) -> Result<(), String> {
-    match parse_device_command(args)? {
+fn run_device_command(command: DeviceCommand) -> Result<(), String> {
+    match command {
         DeviceCommand::List => {
             let devices = list_devices()?;
             print_devices(&devices);
@@ -139,192 +109,6 @@ fn run_device_command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
-    match args {
-        [command] if command == "list" => Ok(DeviceCommand::List),
-        [flag, device_id, command]
-            if (flag == "-d" || flag == "--device")
-                && (command == "eject" || command == "unmount") =>
-        {
-            Ok(DeviceCommand::Eject {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [command, flag, device_id]
-            if (command == "eject" || command == "unmount")
-                && (flag == "-d" || flag == "--device") =>
-        {
-            Ok(DeviceCommand::Eject {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [flag, device_id, command]
-            if (flag == "-d" || flag == "--device") && command == "mount" =>
-        {
-            Ok(DeviceCommand::Mount {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [command, flag, device_id]
-            if command == "mount" && (flag == "-d" || flag == "--device") =>
-        {
-            Ok(DeviceCommand::Mount {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [flag, device_id, command]
-            if (flag == "-d" || flag == "--device") && command == "datadisk" =>
-        {
-            Ok(DeviceCommand::Serial {
-                device_id: Some(device_id.clone()),
-                command: "datadisk".to_string(),
-            })
-        }
-        [command, flag, device_id]
-            if command == "datadisk" && (flag == "-d" || flag == "--device") =>
-        {
-            Ok(DeviceCommand::Serial {
-                device_id: Some(device_id.clone()),
-                command: "datadisk".to_string(),
-            })
-        }
-        [flag, device_id, serial_keyword, command]
-            if (flag == "-d" || flag == "--device") && serial_keyword == "serial" =>
-        {
-            Ok(DeviceCommand::Serial {
-                device_id: Some(device_id.clone()),
-                command: command.clone(),
-            })
-        }
-        [serial_keyword, flag, device_id, command]
-            if serial_keyword == "serial" && (flag == "-d" || flag == "--device") =>
-        {
-            Ok(DeviceCommand::Serial {
-                device_id: Some(device_id.clone()),
-                command: command.clone(),
-            })
-        }
-        [command] if command == "eject" || command == "unmount" => {
-            Ok(DeviceCommand::Eject { device_id: None })
-        }
-        [command] if command == "hibernate" => Ok(DeviceCommand::Hibernate { device_id: None }),
-        [flag, device_id, command]
-            if (flag == "-d" || flag == "--device") && command == "hibernate" =>
-        {
-            Ok(DeviceCommand::Hibernate {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [command, flag, device_id]
-            if command == "hibernate" && (flag == "-d" || flag == "--device") =>
-        {
-            Ok(DeviceCommand::Hibernate {
-                device_id: Some(device_id.clone()),
-            })
-        }
-        [command] if command == "mount" => Ok(DeviceCommand::Mount { device_id: None }),
-        [command] if command == "datadisk" => Ok(DeviceCommand::Serial {
-            device_id: None,
-            command: "datadisk".to_string(),
-        }),
-        [serial_keyword, command] if serial_keyword == "serial" => Ok(DeviceCommand::Serial {
-            device_id: None,
-            command: command.clone(),
-        }),
-        _ if args.iter().any(|arg| arg == "stats") => parse_stats_command(args),
-        _ if args.iter().any(|arg| arg == "screenshot") => parse_screenshot_command(args),
-        _ => Err(DEVICE_USAGE.to_string()),
-    }
-}
-
-fn parse_stats_command(args: &[String]) -> Result<DeviceCommand, String> {
-    let stats_count = args.iter().filter(|arg| arg.as_str() == "stats").count();
-    if stats_count != 1 {
-        return Err(DEVICE_USAGE.to_string());
-    }
-
-    let mut device_id: Option<String> = None;
-    let mut json = false;
-    let mut saw_stats = false;
-
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "stats" => {
-                saw_stats = true;
-                i += 1;
-            }
-            "-d" | "--device" => {
-                let value = args.get(i + 1).ok_or_else(|| DEVICE_USAGE.to_string())?;
-                device_id = Some(value.clone());
-                i += 2;
-            }
-            "--json" => {
-                json = true;
-                i += 1;
-            }
-            _ => return Err(DEVICE_USAGE.to_string()),
-        }
-    }
-
-    if !saw_stats {
-        return Err(DEVICE_USAGE.to_string());
-    }
-
-    Ok(DeviceCommand::Stats { device_id, json })
-}
-
-fn parse_screenshot_command(args: &[String]) -> Result<DeviceCommand, String> {
-    let screenshot_count = args
-        .iter()
-        .filter(|arg| arg.as_str() == "screenshot")
-        .count();
-    if screenshot_count != 1 {
-        return Err(DEVICE_USAGE.to_string());
-    }
-
-    let mut device_id: Option<String> = None;
-    let mut filename: Option<String> = None;
-    let mut open = false;
-    let mut saw_screenshot = false;
-
-    let mut i = 0usize;
-    while i < args.len() {
-        let token = args[i].as_str();
-        match token {
-            "screenshot" => {
-                saw_screenshot = true;
-                i += 1;
-            }
-            "-d" | "--device" => {
-                let value = args.get(i + 1).ok_or_else(|| DEVICE_USAGE.to_string())?;
-                device_id = Some(value.clone());
-                i += 2;
-            }
-            "-f" => {
-                let value = args.get(i + 1).ok_or_else(|| DEVICE_USAGE.to_string())?;
-                filename = Some(value.clone());
-                i += 2;
-            }
-            "--open" => {
-                open = true;
-                i += 1;
-            }
-            _ => return Err(DEVICE_USAGE.to_string()),
-        }
-    }
-
-    if !saw_screenshot {
-        return Err(DEVICE_USAGE.to_string());
-    }
-
-    Ok(DeviceCommand::Screenshot {
-        device_id,
-        filename,
-        open,
-    })
 }
 
 fn capture_screenshot(
@@ -512,15 +296,19 @@ fn mount_device(device_id: Option<&str>) -> Result<(String, String), String> {
         }
 
         if Instant::now().duration_since(start) >= MOUNT_WAIT_TIMEOUT {
-            return Err("timed out waiting for device before mount: no Playdate devices found"
-                .to_string());
+            return Err(
+                "timed out waiting for device before mount: no Playdate devices found".to_string(),
+            );
         }
 
         std::thread::sleep(MOUNT_WAIT_POLL);
     }
 }
 
-fn select_mount_target(devices: &[Device], device_id: Option<&str>) -> Result<Option<Device>, String> {
+fn select_mount_target(
+    devices: &[Device],
+    device_id: Option<&str>,
+) -> Result<Option<Device>, String> {
     match device_id {
         Some(id) => {
             let needle = normalize(id);
@@ -637,7 +425,7 @@ fn send_serial_command_and_capture(port_path: &str, command: &str) -> Result<Vec
                 Err(e) => {
                     return Err(format!(
                         "failed to read serial data from '{port_path}': {e}"
-                    ))
+                    ));
                 }
             }
 
@@ -1539,12 +1327,12 @@ fn print_devices(devices: &[Device]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_disk_mount_index, extract_disk_from_device_path, extract_screen_bitmap,
-        find_mount_path_for_serial, find_port_for_serial, is_playdate_product_id, normalize,
-        normalize_metric_value, normalize_stats_entry, parse_device_command,
-        parse_macos_playdate_disks_by_serial, parse_metric_value, parse_mount_entries,
-        parse_stats_entries, resolve_device, screenshot_format_for_path, split_time_fields, Device,
-        DeviceCommand, MountEntry, SCREEN_BITMAP_BYTES, SCREEN_PREFIX,
+        Device, MountEntry, SCREEN_BITMAP_BYTES, SCREEN_PREFIX, build_disk_mount_index,
+        extract_disk_from_device_path, extract_screen_bitmap, find_mount_path_for_serial,
+        find_port_for_serial, is_playdate_product_id, normalize, normalize_metric_value,
+        normalize_stats_entry, parse_macos_playdate_disks_by_serial, parse_metric_value,
+        parse_mount_entries, parse_stats_entries, resolve_device, screenshot_format_for_path,
+        split_time_fields,
     };
     use image::ImageFormat;
     use std::collections::HashMap;
@@ -1652,114 +1440,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_device_list_command() {
-        let args = vec!["list".to_string()];
-        let cmd = parse_device_command(&args).expect("expected list command");
-        assert_eq!(cmd, DeviceCommand::List);
-    }
-
-    #[test]
-    fn parses_device_unmount_command_with_flag_first() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "unmount".to_string(),
-        ];
-
-        let cmd = parse_device_command(&args).expect("expected eject command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Eject {
-                device_id: Some("PDU1-Y013705".to_string())
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_eject_command_with_subcommand_first() {
-        let args = vec![
-            "eject".to_string(),
-            "--device".to_string(),
-            "PDU1-Y013705".to_string(),
-        ];
-
-        let cmd = parse_device_command(&args).expect("expected eject command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Eject {
-                device_id: Some("PDU1-Y013705".to_string())
-            }
-        );
-    }
-
-    #[test]
     fn recognizes_both_playdate_product_ids() {
         assert!(is_playdate_product_id(0x5740));
         assert!(is_playdate_product_id(0x5741));
         assert!(!is_playdate_product_id(0x5742));
-    }
-
-    #[test]
-    fn parses_device_mount_alias_command() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "mount".to_string(),
-        ];
-
-        let cmd = parse_device_command(&args).expect("expected mount command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Mount {
-                device_id: Some("PDU1-Y013705".to_string())
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_serial_command() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "serial".to_string(),
-            "help".to_string(),
-        ];
-
-        let cmd = parse_device_command(&args).expect("expected serial command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Serial {
-                device_id: Some("PDU1-Y013705".to_string()),
-                command: "help".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_eject_without_device_flag() {
-        let args = vec!["eject".to_string()];
-        let cmd = parse_device_command(&args).expect("expected eject command");
-        assert_eq!(cmd, DeviceCommand::Eject { device_id: None });
-    }
-
-    #[test]
-    fn parses_device_mount_without_device_flag() {
-        let args = vec!["mount".to_string()];
-        let cmd = parse_device_command(&args).expect("expected mount command");
-        assert_eq!(cmd, DeviceCommand::Mount { device_id: None });
-    }
-
-    #[test]
-    fn parses_device_serial_without_device_flag() {
-        let args = vec!["serial".to_string(), "help".to_string()];
-        let cmd = parse_device_command(&args).expect("expected serial command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Serial {
-                device_id: None,
-                command: "help".to_string()
-            }
-        );
     }
 
     #[test]
@@ -1800,93 +1484,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_device_screenshot_without_flags() {
-        let args = vec!["screenshot".to_string()];
-        let cmd = parse_device_command(&args).expect("expected screenshot command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Screenshot {
-                device_id: None,
-                filename: None,
-                open: false
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_screenshot_with_filename() {
-        let args = vec![
-            "screenshot".to_string(),
-            "-f".to_string(),
-            "capture.gif".to_string(),
-        ];
-        let cmd = parse_device_command(&args).expect("expected screenshot command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Screenshot {
-                device_id: None,
-                filename: Some("capture.gif".to_string()),
-                open: false
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_screenshot_with_device_and_filename() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "screenshot".to_string(),
-            "-f".to_string(),
-            "capture.gif".to_string(),
-        ];
-        let cmd = parse_device_command(&args).expect("expected screenshot command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Screenshot {
-                device_id: Some("PDU1-Y013705".to_string()),
-                filename: Some("capture.gif".to_string()),
-                open: false
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_screenshot_with_open_flag() {
-        let args = vec!["screenshot".to_string(), "--open".to_string()];
-        let cmd = parse_device_command(&args).expect("expected screenshot command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Screenshot {
-                device_id: None,
-                filename: None,
-                open: true
-            }
-        );
-    }
-
-    #[test]
-    fn parses_device_screenshot_with_open_and_filename_and_device() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "screenshot".to_string(),
-            "-f".to_string(),
-            "capture.png".to_string(),
-            "--open".to_string(),
-        ];
-        let cmd = parse_device_command(&args).expect("expected screenshot command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Screenshot {
-                device_id: Some("PDU1-Y013705".to_string()),
-                filename: Some("capture.png".to_string()),
-                open: true
-            }
-        );
-    }
-
-    #[test]
     fn has_expected_screen_prefix_signature() {
         assert_eq!(SCREEN_PREFIX, b"screen\r\n~screen:\n");
     }
@@ -1901,9 +1498,11 @@ mod tests {
             screenshot_format_for_path("capture.gif").expect("gif format"),
             Some(ImageFormat::Gif)
         );
-        assert!(screenshot_format_for_path("capture.raw")
-            .expect("raw format")
-            .is_none());
+        assert!(
+            screenshot_format_for_path("capture.raw")
+                .expect("raw format")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1916,59 +1515,6 @@ mod tests {
         let bitmap = extract_screen_bitmap(&payload).expect("bitmap extraction");
         assert_eq!(bitmap.len(), SCREEN_BITMAP_BYTES);
         assert_eq!(bitmap[0], 0xAA);
-    }
-
-    #[test]
-    fn parses_stats_command_with_json() {
-        let args = vec!["stats".to_string(), "--json".to_string()];
-        let cmd = parse_device_command(&args).expect("expected stats command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Stats {
-                device_id: None,
-                json: true
-            }
-        );
-    }
-
-    #[test]
-    fn parses_stats_command_with_device() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "stats".to_string(),
-        ];
-        let cmd = parse_device_command(&args).expect("expected stats command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Stats {
-                device_id: Some("PDU1-Y013705".to_string()),
-                json: false
-            }
-        );
-    }
-
-    #[test]
-    fn parses_hibernate_without_device_flag() {
-        let args = vec!["hibernate".to_string()];
-        let cmd = parse_device_command(&args).expect("expected hibernate command");
-        assert_eq!(cmd, DeviceCommand::Hibernate { device_id: None });
-    }
-
-    #[test]
-    fn parses_hibernate_with_device_flag() {
-        let args = vec![
-            "-d".to_string(),
-            "PDU1-Y013705".to_string(),
-            "hibernate".to_string(),
-        ];
-        let cmd = parse_device_command(&args).expect("expected hibernate command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Hibernate {
-                device_id: Some("PDU1-Y013705".to_string())
-            }
-        );
     }
 
     #[test]
