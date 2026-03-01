@@ -1,31 +1,28 @@
 mod cli;
+mod screenshot;
+mod stats;
 
 use crate::cli::{DeviceCommand, parse_cli_from_env};
-use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Luma};
+use crate::screenshot::capture_screenshot;
+use crate::stats::{fetch_stats, parse_metric_value, print_stats_json};
 use nusb::MaybeFuture;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
 const PLAYDATE_PRODUCT_ID_APP: u16 = 0x5740;
-const SCREEN_PREFIX: &[u8] = b"screen\r\n~screen:\n";
-const SCREEN_PREFIX_LEGACY: &[u8] = b"\r\nscreen~:\n";
-const SCREEN_BITMAP_BYTES: usize = 12_000;
-const SCREEN_WIDTH: u32 = 400;
-const SCREEN_HEIGHT: u32 = 240;
 const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
 const MOUNT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const MOUNT_WAIT_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Device {
+pub(crate) struct Device {
     device: String,
     port: String,
     mounted: bool,
@@ -56,22 +53,18 @@ fn run_device_command(command: DeviceCommand) -> Result<(), String> {
         DeviceCommand::List => {
             let devices = list_devices()?;
             print_devices(&devices);
-            Ok(())
         }
         DeviceCommand::Eject { device_id } => {
             let serial = eject_device(device_id.as_deref())?;
             println!("ejected {serial}");
-            Ok(())
         }
         DeviceCommand::Serial { device_id, command } => {
             let (serial, port) = send_serial_command_to_device(device_id.as_deref(), &command)?;
             println!("sent '{command}' to {serial} on {port}");
-            Ok(())
         }
         DeviceCommand::Mount { device_id } => {
             let (serial, mount_path) = mount_device(device_id.as_deref())?;
             println!("mounted {serial} at {mount_path}");
-            Ok(())
         }
         DeviceCommand::Screenshot {
             device_id,
@@ -86,146 +79,24 @@ fn run_device_command(command: DeviceCommand) -> Result<(), String> {
                 open_with_default_viewer(&path)?;
                 println!("opened {path}");
             }
-            Ok(())
         }
         DeviceCommand::Stats { device_id, json } => {
-            let (serial, entries, raw) = fetch_stats(device_id.as_deref())?;
+            let (serial, entries) = fetch_stats(device_id.as_deref())?;
             if json {
                 print_stats_json(&entries);
-            } else if entries.is_empty() {
-                println!("stats from {serial}");
-                println!("{}", raw.trim());
             } else {
                 println!("stats from {serial}");
                 for (k, v) in entries {
                     println!("{k}: {v}");
                 }
             }
-            Ok(())
         }
         DeviceCommand::Hibernate { device_id } => {
             let (serial, port) = send_serial_command_to_device(device_id.as_deref(), "hibernate")?;
             println!("sent 'hibernate' to {serial} on {port}");
-            Ok(())
         }
     }
-}
-
-fn capture_screenshot(
-    device_id: Option<&str>,
-    filename: Option<&str>,
-) -> Result<(String, String, usize, String), String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
-    if device.port.is_empty() {
-        return Err(format!(
-            "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.device
-        ));
-    }
-
-    let payload = send_serial_command_and_capture(&device.port, "screen")?;
-    let path = filename
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(default_screenshot_filename);
-    write_screenshot_file(&path, &payload)?;
-
-    let inspect = inspect_screen_payload(&payload, &path);
-    Ok((device.device, path, payload.len(), inspect))
-}
-
-fn write_screenshot_file(path: &str, payload: &[u8]) -> Result<(), String> {
-    match screenshot_format_for_path(path)? {
-        Some(ImageFormat::Png) => {
-            let bitmap = extract_screen_bitmap(payload)?;
-            let image = bitmap_to_image(bitmap);
-            DynamicImage::ImageLuma8(image)
-                .save_with_format(path, ImageFormat::Png)
-                .map_err(|e| format!("failed to write screenshot image '{path}': {e}"))?;
-            Ok(())
-        }
-        Some(ImageFormat::Gif) => {
-            let bitmap = extract_screen_bitmap(payload)?;
-            let image = bitmap_to_image(bitmap);
-            DynamicImage::ImageLuma8(image)
-                .into_rgb8()
-                .save_with_format(path, ImageFormat::Gif)
-                .map_err(|e| format!("failed to write screenshot image '{path}': {e}"))?;
-            Ok(())
-        }
-        Some(other) => Err(format!("unsupported image output format: {other:?}")),
-        None => std::fs::write(path, payload)
-            .map_err(|e| format!("failed to write screenshot file '{path}': {e}")),
-    }
-}
-
-fn screenshot_format_for_path(path: &str) -> Result<Option<ImageFormat>, String> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase());
-
-    match ext.as_deref() {
-        Some("png") => Ok(Some(ImageFormat::Png)),
-        Some("gif") => Ok(Some(ImageFormat::Gif)),
-        Some("raw") | Some("bin") | None => Ok(None),
-        Some(other) => Err(format!(
-            "unsupported screenshot extension '.{other}'; use .png, .gif, .raw, or .bin"
-        )),
-    }
-}
-
-fn extract_screen_bitmap(payload: &[u8]) -> Result<&[u8], String> {
-    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX) {
-        let start = offset + SCREEN_PREFIX.len();
-        let end = start + SCREEN_BITMAP_BYTES;
-        if payload.len() < end {
-            return Err(format!(
-                "screen payload is incomplete: got {} bytes, expected at least {}",
-                payload.len().saturating_sub(start),
-                SCREEN_BITMAP_BYTES
-            ));
-        }
-        return Ok(&payload[start..end]);
-    }
-
-    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX_LEGACY) {
-        let start = offset + SCREEN_PREFIX_LEGACY.len();
-        let end = start + SCREEN_BITMAP_BYTES;
-        if payload.len() < end {
-            return Err(format!(
-                "legacy screen payload is incomplete: got {} bytes, expected at least {}",
-                payload.len().saturating_sub(start),
-                SCREEN_BITMAP_BYTES
-            ));
-        }
-        return Ok(&payload[start..end]);
-    }
-
-    if payload.len() >= SCREEN_BITMAP_BYTES {
-        return Ok(&payload[..SCREEN_BITMAP_BYTES]);
-    }
-
-    Err("no recognizable screen payload in serial output".to_string())
-}
-
-fn bitmap_to_image(bitmap: &[u8]) -> GrayImage {
-    let mut img: GrayImage = ImageBuffer::new(SCREEN_WIDTH, SCREEN_HEIGHT);
-    let stride = (SCREEN_WIDTH / 8) as usize;
-
-    for y in 0..SCREEN_HEIGHT as usize {
-        let row = &bitmap[y * stride..(y + 1) * stride];
-        for x in 0..SCREEN_WIDTH as usize {
-            let byte = row[x / 8];
-            let bit = 7 - (x % 8);
-            let is_white = ((byte >> bit) & 1) == 1;
-            let value = if is_white { 255 } else { 0 };
-            img.put_pixel(x as u32, y as u32, Luma([value]));
-        }
-    }
-
-    img
+    Ok(())
 }
 
 fn send_serial_command_to_device(
@@ -244,35 +115,6 @@ fn send_serial_command_to_device(
 
     send_serial_command(&device.port, command)?;
     Ok((device.device, device.port))
-}
-
-fn fetch_stats(device_id: Option<&str>) -> Result<(String, Vec<(String, String)>, String), String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
-    if device.port.is_empty() {
-        return Err(format!(
-            "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.device
-        ));
-    }
-
-    let payload = send_serial_command_and_capture(&device.port, "stats")?;
-    let raw = String::from_utf8_lossy(&payload).to_string();
-    let mut entries = parse_stats_entries(&raw)
-        .into_iter()
-        .map(|(k, v)| normalize_stats_entry(&k, &v))
-        .collect::<Vec<_>>();
-
-    for command in ["vbat", "batpct", "temp", "gettime"] {
-        let raw_value =
-            query_metric(&device.port, command).unwrap_or_else(|| "unavailable".to_string());
-        for (key, value) in metric_output_entries(command, &raw_value) {
-            entries.push((key, value));
-        }
-    }
-
-    Ok((device.device, entries, raw))
 }
 
 fn mount_device(device_id: Option<&str>) -> Result<(String, String), String> {
@@ -371,7 +213,7 @@ fn find_mount_path_for_serial_live(serial: &str, mounts: &[MountEntry]) -> Optio
     find_any_playdate_mount(mounts)
 }
 
-fn query_metric(port_path: &str, command: &str) -> Option<String> {
+pub(crate) fn query_metric(port_path: &str, command: &str) -> Option<String> {
     let payload = send_serial_command_and_capture(port_path, command).ok()?;
     let raw = String::from_utf8_lossy(&payload);
     parse_metric_value(command, &raw)
@@ -397,7 +239,10 @@ fn send_serial_command(port_path: &str, command: &str) -> Result<(), String> {
     }
 }
 
-fn send_serial_command_and_capture(port_path: &str, command: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn send_serial_command_and_capture(
+    port_path: &str,
+    command: &str,
+) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         let mut port = open_serial_port(port_path)?;
@@ -499,328 +344,6 @@ fn configure_serial_port_8n1_115200(fd: std::os::fd::RawFd) -> Result<(), std::i
     Ok(())
 }
 
-fn default_screenshot_filename() -> String {
-    format!("playdate_{}.gif", timestamp_now())
-}
-
-#[cfg(unix)]
-fn timestamp_now() -> String {
-    let output = Command::new("date").arg("+%Y-%m-%d_%H%M%S").output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => "1970-01-01_000000".to_string(),
-    }
-}
-
-#[cfg(not(unix))]
-fn timestamp_now() -> String {
-    "1970-01-01_000000".to_string()
-}
-
-fn inspect_screen_payload(payload: &[u8], path: &str) -> String {
-    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX)
-        .or_else(|| find_subslice(payload, SCREEN_PREFIX_LEGACY))
-    {
-        let image_start = offset + SCREEN_PREFIX.len();
-        let remaining = payload.len().saturating_sub(image_start);
-        if remaining >= SCREEN_BITMAP_BYTES {
-            return format!(
-                "detected screen header at byte {offset}; bitmap payload appears complete ({remaining} bytes after header), wrote {}",
-                screenshot_kind_for_path(path)
-            );
-        }
-
-        return format!(
-            "detected screen header at byte {offset}; bitmap payload appears partial ({remaining}/{SCREEN_BITMAP_BYTES} bytes after header), wrote {}",
-            screenshot_kind_for_path(path)
-        );
-    }
-
-    let preview_len = payload.len().min(32);
-    let preview = payload[..preview_len]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "no known screen header found; first {preview_len} bytes (hex): {preview}; wrote {}",
-        screenshot_kind_for_path(path)
-    )
-}
-
-fn screenshot_kind_for_path(path: &str) -> &'static str {
-    match screenshot_format_for_path(path) {
-        Ok(Some(ImageFormat::Png)) => "PNG image",
-        Ok(Some(ImageFormat::Gif)) => "GIF image",
-        _ => "raw serial bytes",
-    }
-}
-
-fn parse_stats_entries(raw: &str) -> Vec<(String, String)> {
-    let mut entries = Vec::new();
-    let normalized = raw.replace('\r', "\n");
-    let mut in_stats = false;
-
-    for line in normalized.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.contains("~stats:") {
-            in_stats = true;
-            continue;
-        }
-        if !in_stats {
-            continue;
-        }
-        if line.starts_with('~') {
-            break;
-        }
-
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let value = v.trim();
-            if !key.is_empty() && !value.is_empty() {
-                entries.push((key.to_string(), value.to_string()));
-            }
-        }
-    }
-
-    entries
-}
-
-fn normalize_stats_entry(key: &str, value: &str) -> (String, String) {
-    let key_lc = key.to_ascii_lowercase();
-
-    if key_lc == "frame count" {
-        return ("frame_count".to_string(), value.to_string());
-    }
-    if key_lc == "frame time" {
-        return ("frame_time".to_string(), value.to_string());
-    }
-    if key_lc == "gc time" {
-        return ("lua_gc_secs".to_string(), value.to_string());
-    }
-    if key_lc == "disp time" {
-        return ("disp_time".to_string(), value.to_string());
-    }
-    if key_lc == "current time" {
-        return ("time_epoch".to_string(), value.to_string());
-    }
-    if key_lc == "mem alloced" {
-        return ("memory_alloced_bytes".to_string(), value.to_string());
-    }
-    if key_lc == "mem reserved" {
-        return ("memory_reserved_bytes".to_string(), value.to_string());
-    }
-    if key_lc == "mem total" {
-        return ("memory_total_bytes".to_string(), value.to_string());
-    }
-
-    let cpu_component = match key_lc.as_str() {
-        "kernel" => Some("kernel"),
-        "serial" => Some("serial"),
-        "game" => Some("game"),
-        "gc" => Some("gc"),
-        "wifi" => Some("wifi"),
-        "trace" => Some("trace"),
-        "audio" => Some("audio"),
-        _ => None,
-    };
-
-    if let Some(component) = cpu_component {
-        let out_key = format!("cpu_{component}_percent");
-        let out_value = extract_first_float(value)
-            .map(|f| format!("{f:.2}"))
-            .unwrap_or_else(|| value.to_string());
-        return (out_key, out_value);
-    }
-
-    (key.to_string(), value.to_string())
-}
-
-fn parse_metric_value(command: &str, raw: &str) -> Option<String> {
-    let normalized = raw.replace('\r', "\n");
-    let header = format!("~{command}:");
-    let command_prefix = format!("{command}:");
-    let mut after_header = false;
-    let mut saw_command_echo = false;
-    let command_lc = command.to_ascii_lowercase();
-
-    for line in normalized.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let line_lc = line.to_ascii_lowercase();
-
-        if line.contains(&header) {
-            after_header = true;
-            if let Some((_, rhs)) = line.split_once(':') {
-                let value = rhs.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-            continue;
-        }
-
-        if line_lc == command_lc {
-            saw_command_echo = true;
-            continue;
-        }
-
-        if line_lc.starts_with(&command_prefix) {
-            if let Some((_, rhs)) = line.split_once(':') {
-                let value = rhs.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-
-        if let Some((lhs, rhs)) = line.split_once('=') {
-            let lhs_lc = lhs.trim().to_ascii_lowercase();
-            if lhs_lc.contains(&command_lc)
-                || command_lc == "vbat"
-                || command_lc == "batpct"
-                || command_lc == "temp"
-            {
-                let value = rhs.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-
-        if after_header {
-            return Some(line.to_string());
-        }
-
-        if saw_command_echo {
-            return Some(line.to_string());
-        }
-    }
-
-    None
-}
-
-fn normalize_metric_value(command: &str, value: &str) -> String {
-    match command {
-        "vbat" => extract_first_float(value)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| value.to_string()),
-        "batpct" => extract_first_float(value)
-            .map(|n| format!("{n:.2}"))
-            .unwrap_or_else(|| value.to_string()),
-        "temp" => extract_first_int(value)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| value.to_string()),
-        _ => value.to_string(),
-    }
-}
-
-fn metric_output_entries(command: &str, value: &str) -> Vec<(String, String)> {
-    match command {
-        "vbat" => vec![(
-            "battery_volts".to_string(),
-            normalize_metric_value("vbat", value),
-        )],
-        "batpct" => vec![(
-            "battery_percent".to_string(),
-            normalize_metric_value("batpct", value),
-        )],
-        "temp" => vec![(
-            "temp_celsius".to_string(),
-            normalize_metric_value("temp", value),
-        )],
-        "gettime" => {
-            let (utc, weekday) = split_time_fields(value);
-            vec![
-                ("time_utc".to_string(), utc),
-                ("time_weekday".to_string(), weekday),
-            ]
-        }
-        _ => vec![(command.to_string(), value.to_string())],
-    }
-}
-
-fn split_time_fields(value: &str) -> (String, String) {
-    let trimmed = value.trim();
-    if let Some((utc, rest)) = trimmed.split_once(" (") {
-        let weekday = rest.trim_end_matches(')').trim();
-        let utc = utc.trim();
-        let weekday = if weekday.is_empty() {
-            "unavailable"
-        } else {
-            weekday
-        };
-        return (utc.to_string(), weekday.to_string());
-    }
-
-    (trimmed.to_string(), "unavailable".to_string())
-}
-
-fn extract_first_float(s: &str) -> Option<f64> {
-    s.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-        .filter(|token| !token.is_empty() && *token != "-" && *token != "." && *token != "-.")
-        .find_map(|token| token.parse::<f64>().ok())
-}
-
-fn extract_first_int(s: &str) -> Option<i64> {
-    s.split(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .filter(|token| !token.is_empty() && *token != "-")
-        .find_map(|token| token.parse::<i64>().ok())
-}
-
-fn print_stats_json(entries: &[(String, String)]) {
-    println!("{{");
-    for (idx, (k, v)) in entries.iter().enumerate() {
-        let comma = if idx + 1 < entries.len() { "," } else { "" };
-        if k.starts_with("cpu_") && k.ends_with("_percent") {
-            if let Ok(f) = v.parse::<f64>() {
-                if f.is_finite() {
-                    println!("  \"{}\": {:.1}{}", escape_json(k), f, comma);
-                    continue;
-                }
-            }
-        }
-        if k == "battery_percent" {
-            if let Ok(f) = v.parse::<f64>() {
-                if f.is_finite() {
-                    println!("  \"{}\": {:.2}{}", escape_json(k), f, comma);
-                    continue;
-                }
-            }
-        }
-        if let Ok(i) = v.parse::<i64>() {
-            println!("  \"{}\": {}{}", escape_json(k), i, comma);
-            continue;
-        }
-        if let Ok(f) = v.parse::<f64>() {
-            if f.is_finite() {
-                println!("  \"{}\": {}{}", escape_json(k), f, comma);
-                continue;
-            }
-        }
-        println!("  \"{}\": \"{}\"{}", escape_json(k), escape_json(v), comma);
-    }
-    println!("}}");
-}
-
-fn escape_json(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            _ => vec![c],
-        })
-        .collect()
-}
-
 fn open_with_default_viewer(path: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -859,16 +382,6 @@ fn open_with_default_viewer(path: &str) -> Result<(), String> {
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 fn eject_device(device_id: Option<&str>) -> Result<String, String> {
     let devices = list_devices()?;
     let device = resolve_device(devices, device_id)?;
@@ -877,7 +390,10 @@ fn eject_device(device_id: Option<&str>) -> Result<String, String> {
     Ok(device.device)
 }
 
-fn resolve_device(devices: Vec<Device>, device_id: Option<&str>) -> Result<Device, String> {
+pub(crate) fn resolve_device(
+    devices: Vec<Device>,
+    device_id: Option<&str>,
+) -> Result<Device, String> {
     match device_id {
         Some(id) => {
             let needle = normalize(id);
@@ -946,7 +462,7 @@ fn eject_target(_disk: &str, _mount_path: &str) -> Result<(), String> {
     Err("eject is not supported on this platform yet".to_string())
 }
 
-fn list_devices() -> Result<Vec<Device>, String> {
+pub(crate) fn list_devices() -> Result<Vec<Device>, String> {
     let serial_ports = list_serial_ports();
     let mounts = list_mounts().unwrap_or_default();
     let disk_mounts = build_disk_mount_index(&mounts);
@@ -966,7 +482,10 @@ fn list_devices() -> Result<Vec<Device>, String> {
         .map_err(|e| format!("failed to list USB devices: {e}"))?;
 
     for usb in usb_devices {
-        if !is_playdate_usb_device(usb.vendor_id(), usb.product_id()) {
+        if usb.vendor_id() != PLAYDATE_VENDOR_ID
+            || (usb.product_id() != PLAYDATE_PRODUCT_ID_MSC
+                && usb.product_id() != PLAYDATE_PRODUCT_ID_APP)
+        {
             continue;
         }
 
@@ -1048,29 +567,24 @@ fn list_mounts() -> Result<Vec<MountEntry>, String> {
     let text = String::from_utf8(output.stdout)
         .map_err(|e| format!("mount returned non-UTF8 output: {e}"))?;
 
-    Ok(parse_mount_entries(&text))
+    let mounts = text
+        .lines()
+        .filter_map(|line| {
+            let (source, rest) = line.split_once(" on ")?;
+            let (target, _) = rest.split_once(" (")?;
+            Some(MountEntry {
+                source: source.trim().to_string(),
+                target: target.trim().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(mounts)
 }
 
 #[cfg(not(unix))]
 fn list_mounts() -> Result<Vec<MountEntry>, String> {
     Ok(Vec::new())
-}
-
-fn parse_mount_entries(input: &str) -> Vec<MountEntry> {
-    input
-        .lines()
-        .filter_map(parse_mount_line)
-        .collect::<Vec<_>>()
-}
-
-fn parse_mount_line(line: &str) -> Option<MountEntry> {
-    let (source, rest) = line.split_once(" on ")?;
-    let (target, _) = rest.split_once(" (")?;
-
-    Some(MountEntry {
-        source: source.trim().to_string(),
-        target: target.trim().to_string(),
-    })
 }
 
 fn build_disk_mount_index(mounts: &[MountEntry]) -> HashMap<String, String> {
@@ -1182,7 +696,7 @@ fn parse_macos_playdate_disks_by_serial(input: &str) -> HashMap<String, Vec<Stri
 
         if line.contains("\"idProduct\" =") {
             if let Some(v) = parse_ioreg_u16_value(line) {
-                saw_product = is_playdate_product_id(v);
+                saw_product = v == PLAYDATE_PRODUCT_ID_MSC || v == PLAYDATE_PRODUCT_ID_APP;
             }
             continue;
         }
@@ -1265,14 +779,6 @@ fn find_port_for_serial(serial: &str, ports: &[String]) -> Option<String> {
         .cloned()
 }
 
-fn is_playdate_usb_device(vendor_id: u16, product_id: u16) -> bool {
-    vendor_id == PLAYDATE_VENDOR_ID && is_playdate_product_id(product_id)
-}
-
-fn is_playdate_product_id(product_id: u16) -> bool {
-    product_id == PLAYDATE_PRODUCT_ID_MSC || product_id == PLAYDATE_PRODUCT_ID_APP
-}
-
 fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -1327,14 +833,10 @@ fn print_devices(devices: &[Device]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Device, MountEntry, SCREEN_BITMAP_BYTES, SCREEN_PREFIX, build_disk_mount_index,
-        extract_disk_from_device_path, extract_screen_bitmap, find_mount_path_for_serial,
-        find_port_for_serial, is_playdate_product_id, normalize, normalize_metric_value,
-        normalize_stats_entry, parse_macos_playdate_disks_by_serial, parse_metric_value,
-        parse_mount_entries, parse_stats_entries, resolve_device, screenshot_format_for_path,
-        split_time_fields,
+        Device, MountEntry, build_disk_mount_index, extract_disk_from_device_path,
+        find_mount_path_for_serial, find_port_for_serial, normalize,
+        parse_macos_playdate_disks_by_serial, resolve_device,
     };
-    use image::ImageFormat;
     use std::collections::HashMap;
 
     #[test]
@@ -1355,29 +857,6 @@ mod tests {
 
         let got = find_port_for_serial("PDU1-Y013705", &ports);
         assert_eq!(got.as_deref(), Some("/dev/cu.usbmodemPDU1_Y013705"));
-    }
-
-    #[test]
-    fn parses_mount_entries() {
-        let input = r#"
-/dev/disk8s1 on /Volumes/PLAYDATE (msdos, local)
-/dev/disk1s1 on /System/Volumes/Data (apfs, local)
-"#;
-
-        let mounts = parse_mount_entries(input);
-        assert_eq!(
-            mounts,
-            vec![
-                MountEntry {
-                    source: "/dev/disk8s1".to_string(),
-                    target: "/Volumes/PLAYDATE".to_string()
-                },
-                MountEntry {
-                    source: "/dev/disk1s1".to_string(),
-                    target: "/System/Volumes/Data".to_string()
-                }
-            ]
-        );
     }
 
     #[test]
@@ -1440,13 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_both_playdate_product_ids() {
-        assert!(is_playdate_product_id(0x5740));
-        assert!(is_playdate_product_id(0x5741));
-        assert!(!is_playdate_product_id(0x5742));
-    }
-
-    #[test]
     fn resolve_device_auto_selects_single_device() {
         let devices = vec![Device {
             device: "PDU1-Y013705".to_string(),
@@ -1481,142 +953,5 @@ mod tests {
 
         let err = resolve_device(devices, None).expect_err("expected multiple-device error");
         assert!(err.contains("multiple Playdate devices found"));
-    }
-
-    #[test]
-    fn has_expected_screen_prefix_signature() {
-        assert_eq!(SCREEN_PREFIX, b"screen\r\n~screen:\n");
-    }
-
-    #[test]
-    fn screenshot_format_detects_png_and_gif() {
-        assert_eq!(
-            screenshot_format_for_path("capture.png").expect("png format"),
-            Some(ImageFormat::Png)
-        );
-        assert_eq!(
-            screenshot_format_for_path("capture.gif").expect("gif format"),
-            Some(ImageFormat::Gif)
-        );
-        assert!(
-            screenshot_format_for_path("capture.raw")
-                .expect("raw format")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn extracts_bitmap_after_screen_prefix() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(SCREEN_PREFIX);
-        payload.extend_from_slice(&vec![0xAA; SCREEN_BITMAP_BYTES]);
-        payload.extend_from_slice(b"\r\n");
-
-        let bitmap = extract_screen_bitmap(&payload).expect("bitmap extraction");
-        assert_eq!(bitmap.len(), SCREEN_BITMAP_BYTES);
-        assert_eq!(bitmap[0], 0xAA);
-    }
-
-    #[test]
-    fn parses_stats_payload_entries() {
-        let raw = "stats\r\n~stats:\nframe count: 194503\nframe time: 0.000977\nkernel: 0.1%\n";
-        let entries = parse_stats_entries(raw);
-        assert_eq!(
-            entries,
-            vec![
-                ("frame count".to_string(), "194503".to_string()),
-                ("frame time".to_string(), "0.000977".to_string()),
-                ("kernel".to_string(), "0.1%".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalizes_stats_current_time_and_cpu_fields() {
-        assert_eq!(
-            normalize_stats_entry("frame count", "119424"),
-            ("frame_count".to_string(), "119424".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("frame time", "0.005371"),
-            ("frame_time".to_string(), "0.005371".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("gc time", "0.004395"),
-            ("lua_gc_secs".to_string(), "0.004395".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("disp time", "13"),
-            ("disp_time".to_string(), "13".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("current time", "5698432"),
-            ("time_epoch".to_string(), "5698432".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("mem alloced", "1523196"),
-            ("memory_alloced_bytes".to_string(), "1523196".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("mem reserved", "1849152"),
-            ("memory_reserved_bytes".to_string(), "1849152".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("mem total", "16514612"),
-            ("memory_total_bytes".to_string(), "16514612".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("GC", "9.4%"),
-            ("cpu_gc_percent".to_string(), "9.40".to_string())
-        );
-        assert_eq!(
-            normalize_stats_entry("audio", "0.4%"),
-            ("cpu_audio_percent".to_string(), "0.40".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_metric_value_with_header_line() {
-        let raw = "vbat\r\n~vbat:\n4.12\r\n";
-        let value = parse_metric_value("vbat", raw).expect("vbat value");
-        assert_eq!(value, "4.12");
-    }
-
-    #[test]
-    fn parses_metric_value_inline() {
-        let raw = "batpct: 96%\r\n";
-        let value = parse_metric_value("batpct", raw).expect("batpct value");
-        assert_eq!(value, "96%");
-    }
-
-    #[test]
-    fn parses_metric_value_equals_style() {
-        let raw = "vbat\r\nVBAT=4.202000\r\n";
-        let value = parse_metric_value("vbat", raw).expect("vbat equals value");
-        assert_eq!(value, "4.202000");
-    }
-
-    #[test]
-    fn parses_metric_value_after_command_echo() {
-        let raw = "gettime\r\n2026-03-01T03:02:02.534Z (Sunday)\r\n";
-        let value = parse_metric_value("gettime", raw).expect("gettime value");
-        assert_eq!(value, "2026-03-01T03:02:02.534Z (Sunday)");
-    }
-
-    #[test]
-    fn normalizes_battery_and_temp_values() {
-        assert_eq!(normalize_metric_value("vbat", "VBAT=4.202000"), "4.202");
-        assert_eq!(
-            normalize_metric_value("batpct", "PCT=100.00% RAWPCT=100.00%"),
-            "100.00"
-        );
-        assert_eq!(normalize_metric_value("temp", "TEMP=20 C"), "20");
-    }
-
-    #[test]
-    fn splits_time_into_utc_and_weekday() {
-        let (utc, weekday) = split_time_fields("2026-03-01T03:08:40.152Z (Sunday)");
-        assert_eq!(utc, "2026-03-01T03:08:40.152Z");
-        assert_eq!(weekday, "Sunday");
     }
 }
