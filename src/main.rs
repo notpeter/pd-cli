@@ -19,6 +19,8 @@ const SCREEN_WIDTH: u32 = 400;
 const SCREEN_HEIGHT: u32 = 240;
 const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
+const MOUNT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
+const MOUNT_WAIT_POLL: Duration = Duration::from_millis(250);
 const DEVICE_USAGE: &str = "usage: pd device list | pd device [-d <serial>] eject | pd device [-d <serial>] hibernate | pd device [-d <serial>] mount | pd device [-d <serial>] datadisk | pd device [-d <serial>] serial <command> | pd device [-d <serial>] stats [--json] | pd device [-d <serial>] screenshot [-f <filename>] [--open]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,9 @@ enum DeviceCommand {
     Serial {
         device_id: Option<String>,
         command: String,
+    },
+    Mount {
+        device_id: Option<String>,
     },
     Screenshot {
         device_id: Option<String>,
@@ -91,6 +96,11 @@ fn run_device_command(args: &[String]) -> Result<(), String> {
         DeviceCommand::Serial { device_id, command } => {
             let (serial, port) = send_serial_command_to_device(device_id.as_deref(), &command)?;
             println!("sent '{command}' to {serial} on {port}");
+            Ok(())
+        }
+        DeviceCommand::Mount { device_id } => {
+            let (serial, mount_path) = mount_device(device_id.as_deref())?;
+            println!("mounted {serial} at {mount_path}");
             Ok(())
         }
         DeviceCommand::Screenshot {
@@ -151,8 +161,21 @@ fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
             })
         }
         [flag, device_id, command]
-            if (flag == "-d" || flag == "--device")
-                && (command == "mount" || command == "datadisk") =>
+            if (flag == "-d" || flag == "--device") && command == "mount" =>
+        {
+            Ok(DeviceCommand::Mount {
+                device_id: Some(device_id.clone()),
+            })
+        }
+        [command, flag, device_id]
+            if command == "mount" && (flag == "-d" || flag == "--device") =>
+        {
+            Ok(DeviceCommand::Mount {
+                device_id: Some(device_id.clone()),
+            })
+        }
+        [flag, device_id, command]
+            if (flag == "-d" || flag == "--device") && command == "datadisk" =>
         {
             Ok(DeviceCommand::Serial {
                 device_id: Some(device_id.clone()),
@@ -160,8 +183,7 @@ fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
             })
         }
         [command, flag, device_id]
-            if (command == "mount" || command == "datadisk")
-                && (flag == "-d" || flag == "--device") =>
+            if command == "datadisk" && (flag == "-d" || flag == "--device") =>
         {
             Ok(DeviceCommand::Serial {
                 device_id: Some(device_id.clone()),
@@ -202,7 +224,8 @@ fn parse_device_command(args: &[String]) -> Result<DeviceCommand, String> {
                 device_id: Some(device_id.clone()),
             })
         }
-        [command] if command == "mount" || command == "datadisk" => Ok(DeviceCommand::Serial {
+        [command] if command == "mount" => Ok(DeviceCommand::Mount { device_id: None }),
+        [command] if command == "datadisk" => Ok(DeviceCommand::Serial {
             device_id: None,
             command: "datadisk".to_string(),
         }),
@@ -466,6 +489,98 @@ fn fetch_stats(device_id: Option<&str>) -> Result<(String, Vec<(String, String)>
     }
 
     Ok((device.device, entries, raw))
+}
+
+fn mount_device(device_id: Option<&str>) -> Result<(String, String), String> {
+    let start = Instant::now();
+
+    loop {
+        let devices = list_devices().unwrap_or_default();
+        match select_mount_target(&devices, device_id) {
+            Ok(Some(device)) => {
+                if device.port.is_empty() {
+                    let mount_path = wait_for_mount_ready(&device.device)?;
+                    return Ok((device.device, mount_path));
+                }
+
+                send_serial_command(&device.port, "datadisk")?;
+                let mount_path = wait_for_mount_ready(&device.device)?;
+                return Ok((device.device, mount_path));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+
+        if Instant::now().duration_since(start) >= MOUNT_WAIT_TIMEOUT {
+            return Err("timed out waiting for device before mount: no Playdate devices found"
+                .to_string());
+        }
+
+        std::thread::sleep(MOUNT_WAIT_POLL);
+    }
+}
+
+fn select_mount_target(devices: &[Device], device_id: Option<&str>) -> Result<Option<Device>, String> {
+    match device_id {
+        Some(id) => {
+            let needle = normalize(id);
+            Ok(devices
+                .iter()
+                .find(|d| normalize(&d.device) == needle)
+                .cloned())
+        }
+        None => match devices.len() {
+            0 => Ok(None),
+            1 => Ok(Some(devices[0].clone())),
+            _ => Err("multiple Playdate devices found; specify one with `-d <serial>`".to_string()),
+        },
+    }
+}
+
+fn wait_for_mount_ready(serial: &str) -> Result<String, String> {
+    let start = Instant::now();
+    let mut last_seen_mount: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        let mounts = list_mounts().unwrap_or_default();
+        if let Some(path) = find_mount_path_for_serial_live(serial, &mounts) {
+            last_seen_mount = Some(path.clone());
+            match std::fs::read_dir(&path) {
+                Ok(mut iter) => {
+                    let _ = iter.next();
+                    return Ok(path);
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        if Instant::now().duration_since(start) >= MOUNT_WAIT_TIMEOUT {
+            let seen = last_seen_mount.unwrap_or_else(|| "<not mounted>".to_string());
+            let err = last_error.unwrap_or_else(|| "mount not yet readable".to_string());
+            return Err(format!(
+                "timed out waiting for Playdate data disk to become readable (last mount: {seen}, last error: {err})"
+            ));
+        }
+
+        std::thread::sleep(MOUNT_WAIT_POLL);
+    }
+}
+
+fn find_mount_path_for_serial_live(serial: &str, mounts: &[MountEntry]) -> Option<String> {
+    let disk_mounts = build_disk_mount_index(mounts);
+
+    #[cfg(target_os = "macos")]
+    {
+        let serial_to_disks = list_macos_playdate_disks_by_serial().unwrap_or_default();
+        if let Some(path) = find_mount_path_for_serial(serial, &serial_to_disks, &disk_mounts) {
+            return Some(path);
+        }
+    }
+
+    find_any_playdate_mount(mounts)
 }
 
 fn query_metric(port_path: &str, command: &str) -> Option<String> {
@@ -1592,12 +1707,11 @@ mod tests {
             "mount".to_string(),
         ];
 
-        let cmd = parse_device_command(&args).expect("expected serial datadisk command");
+        let cmd = parse_device_command(&args).expect("expected mount command");
         assert_eq!(
             cmd,
-            DeviceCommand::Serial {
-                device_id: Some("PDU1-Y013705".to_string()),
-                command: "datadisk".to_string()
+            DeviceCommand::Mount {
+                device_id: Some("PDU1-Y013705".to_string())
             }
         );
     }
@@ -1631,14 +1745,8 @@ mod tests {
     #[test]
     fn parses_device_mount_without_device_flag() {
         let args = vec!["mount".to_string()];
-        let cmd = parse_device_command(&args).expect("expected mount/datadisk command");
-        assert_eq!(
-            cmd,
-            DeviceCommand::Serial {
-                device_id: None,
-                command: "datadisk".to_string()
-            }
-        );
+        let cmd = parse_device_command(&args).expect("expected mount command");
+        assert_eq!(cmd, DeviceCommand::Mount { device_id: None });
     }
 
     #[test]
