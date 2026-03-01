@@ -1,3 +1,4 @@
+use crate::device::DeviceSerial;
 use core_foundation_sys::{
     base::{CFGetTypeID, CFRelease, CFTypeRef, kCFAllocatorDefault},
     number::{CFNumberGetTypeID, CFNumberGetValue, CFNumberRef, kCFNumberSInt32Type},
@@ -11,9 +12,12 @@ use io_kit_sys::{
     types::{io_iterator_t, io_object_t, io_registry_entry_t},
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::os::raw::{c_char, c_void};
+use std::path::Path;
 use std::process::Command;
+
+use super::SerialPortPath;
+use super::unix::{list_mounts_via_mount_command, list_serial_ports_from_dev};
 
 const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
@@ -30,17 +34,15 @@ pub(crate) fn open_with_default_viewer(path: &str) -> Result<(), String> {
     Err(format!("open failed for '{path}'"))
 }
 
-pub(crate) fn eject_target(disk: &str, mount_path: &str) -> Result<(), String> {
-    let target = if !disk.is_empty() {
-        format!("/dev/{disk}")
-    } else if !mount_path.is_empty() {
-        mount_path.to_string()
-    } else {
-        return Err("device has no known disk or mount path to eject".to_string());
+pub(crate) fn eject_target(mount_path: Option<&Path>) -> Result<(), String> {
+    let target = match mount_path {
+        Some(path) => path,
+        None => return Err("device has no mount path to eject".to_string()),
     };
 
     let output = Command::new("diskutil")
-        .args(["eject", &target])
+        .arg("eject")
+        .arg(target.as_os_str())
         .output()
         .map_err(|e| format!("failed to run diskutil: {e}"))?;
 
@@ -50,56 +52,18 @@ pub(crate) fn eject_target(disk: &str, mount_path: &str) -> Result<(), String> {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(format!("failed to eject '{target}': {stdout}{stderr}"))
+    Err(format!(
+        "failed to eject '{}': {stdout}{stderr}",
+        target.display()
+    ))
 }
 
-pub(crate) fn list_serial_ports() -> Vec<String> {
-    let mut ports = Vec::new();
-
-    let entries = match fs::read_dir("/dev") {
-        Ok(entries) => entries,
-        Err(_) => return ports,
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        let is_usb_serial = name.starts_with("cu.usbmodem")
-            || name.starts_with("tty.usbmodem")
-            || name.starts_with("ttyACM")
-            || name.starts_with("ttyUSB");
-
-        if is_usb_serial {
-            ports.push(format!("/dev/{name}"));
-        }
-    }
-
-    ports.sort();
-    ports
+pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
+    list_serial_ports_from_dev()
 }
 
 pub(crate) fn list_mounts() -> Result<Vec<(String, String)>, String> {
-    let output = Command::new("mount")
-        .output()
-        .map_err(|e| format!("failed to run mount: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("mount failed: {stderr}"));
-    }
-
-    let text = String::from_utf8(output.stdout)
-        .map_err(|e| format!("mount returned non-UTF8 output: {e}"))?;
-
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let (source, rest) = line.split_once(" on ")?;
-            let (target, _) = rest.split_once(" (")?;
-            Some((source.trim().to_string(), target.trim().to_string()))
-        })
-        .collect())
+    list_mounts_via_mount_command()
 }
 
 pub(crate) fn list_playdate_disks_by_serial() -> Result<HashMap<String, Vec<String>>, String> {
@@ -152,8 +116,11 @@ pub(crate) fn list_playdate_disks_by_serial() -> Result<HashMap<String, Vec<Stri
             continue;
         }
 
+        let Some(serial) = DeviceSerial::parse(&serial) else {
+            continue;
+        };
         by_serial
-            .entry(normalize(&serial))
+            .entry(serial.core().to_string())
             .or_default()
             .extend(disks);
     }
@@ -261,13 +228,6 @@ fn cfstring_to_string(value: CFStringRef) -> Option<String> {
 
     let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
     cstr.to_str().ok().map(ToOwned::to_owned)
-}
-
-fn normalize(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
 }
 
 struct IoObjectGuard(io_object_t);

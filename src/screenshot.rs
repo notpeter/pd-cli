@@ -2,8 +2,7 @@ use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Luma};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::device::{list_devices, resolve_device};
-use crate::platform::send_serial_command_and_capture;
+use crate::usb::{list_devices, resolve_device};
 
 const SCREEN_PREFIX: &[u8] = b"screen\r\n~screen:\n";
 const SCREEN_PREFIX_LEGACY: &[u8] = b"\r\nscreen~:\n";
@@ -18,21 +17,21 @@ pub(crate) fn capture_screenshot(
     let devices = list_devices()?;
     let device = resolve_device(devices, device_id)?;
 
-    if device.port.is_empty() {
+    let Some(port) = device.port() else {
         return Err(format!(
             "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.device
+            device.serial()
         ));
-    }
+    };
 
-    let payload = send_serial_command_and_capture(&device.port, "screen")?;
+    let payload = port.send_serial_command_and_capture("screen")?;
     let path = filename
         .map(ToOwned::to_owned)
         .unwrap_or_else(default_screenshot_filename);
     write_screenshot_file(&path, &payload)?;
 
     let inspect = inspect_screen_payload(&payload, &path);
-    Ok((device.device, path, payload.len(), inspect))
+    Ok((device.serial().to_string(), path, payload.len(), inspect))
 }
 
 fn write_screenshot_file(path: &str, payload: &[u8]) -> Result<(), String> {

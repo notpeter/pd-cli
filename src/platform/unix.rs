@@ -1,6 +1,9 @@
+use crate::platform::SerialPortPath;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -35,8 +38,59 @@ pub(crate) fn configure_serial_port_8n1_115200(
     Ok(())
 }
 
+pub(crate) fn list_serial_ports_from_dev() -> Vec<SerialPortPath> {
+    let mut ports = Vec::new();
+
+    let entries = match fs::read_dir("/dev") {
+        Ok(entries) => entries,
+        Err(_) => return ports,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        let is_usb_serial = name.starts_with("cu.usbmodem")
+            || name.starts_with("tty.usbmodem")
+            || name.starts_with("ttyACM")
+            || name.starts_with("ttyUSB");
+
+        if is_usb_serial {
+            ports.push(SerialPortPath::new(format!("/dev/{name}").into()));
+        }
+    }
+
+    ports.sort();
+    ports
+}
+
+pub(crate) fn list_mounts_via_mount_command() -> Result<Vec<(String, String)>, String> {
+    let output = Command::new("mount")
+        .output()
+        .map_err(|e| format!("failed to run mount: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("mount failed: {stderr}"));
+    }
+
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("mount returned non-UTF8 output: {e}"))?;
+
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let (source, rest) = line.split_once(" on ")?;
+            let (target, _) = rest.split_once(" (")?;
+            Some((source.trim().to_string(), target.trim().to_string()))
+        })
+        .collect())
+}
+
 #[cfg(unix)]
-pub(crate) fn build_disk_mounts(mounts: &[(String, String)]) -> HashMap<String, String> {
+pub(crate) fn build_disk_mounts(
+    mounts: &[(String, String)],
+) -> Result<HashMap<String, String>, String> {
     let mut by_disk = HashMap::new();
 
     for (source, target) in mounts {
@@ -57,84 +111,80 @@ pub(crate) fn build_disk_mounts(mounts: &[(String, String)]) -> HashMap<String, 
         }
     }
 
-    by_disk
+    Ok(by_disk)
 }
 
-pub(crate) fn send_serial_command_and_capture(
-    port_path: &str,
-    command: &str,
-) -> Result<Vec<u8>, String> {
-    const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
-    const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
+impl SerialPortPath {
+    pub(crate) fn send_serial_command_and_capture(&self, command: &str) -> Result<Vec<u8>, String> {
+        const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+        const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
 
-    let mut port = open_serial_port(port_path)?;
+        let mut port = self.open_serial_port()?;
+        let payload = format!("{command}\n");
+        port.write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write command to '{}': {e}", self))?;
+        port.flush()
+            .map_err(|e| format!("failed to flush command to '{}': {e}", self))?;
 
-    let payload = format!("{command}\n");
-    port.write_all(payload.as_bytes())
-        .map_err(|e| format!("failed to write command to '{port_path}': {e}"))?;
-    port.flush()
-        .map_err(|e| format!("failed to flush command to '{port_path}': {e}"))?;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let start = Instant::now();
+        let mut last_read = Instant::now();
 
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let start = Instant::now();
-    let mut last_read = Instant::now();
-
-    loop {
-        match port.read(&mut buf) {
-            Ok(n) if n > 0 => {
-                out.extend_from_slice(&buf[..n]);
-                last_read = Instant::now();
+        loop {
+            match port.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    out.extend_from_slice(&buf[..n]);
+                    last_read = Instant::now();
+                }
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    return Err(format!("failed to read serial data from '{}': {e}", self));
+                }
             }
-            Ok(_) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                return Err(format!(
-                    "failed to read serial data from '{port_path}': {e}"
-                ));
+
+            if !out.is_empty() && Instant::now().duration_since(last_read) >= SCREEN_CAPTURE_IDLE {
+                break;
+            }
+
+            if Instant::now().duration_since(start) >= SCREEN_CAPTURE_TIMEOUT {
+                break;
             }
         }
 
-        if !out.is_empty() && Instant::now().duration_since(last_read) >= SCREEN_CAPTURE_IDLE {
-            break;
+        if out.is_empty() {
+            return Err(format!(
+                "no screenshot data received from '{}'; verify the device is unlocked and in app mode",
+                self
+            ));
         }
 
-        if Instant::now().duration_since(start) >= SCREEN_CAPTURE_TIMEOUT {
-            break;
-        }
+        Ok(out)
     }
 
-    if out.is_empty() {
-        return Err(format!(
-            "no screenshot data received from '{}'; verify the device is unlocked and in app mode",
-            port_path
-        ));
+    pub(crate) fn send_serial_command(&self, command: &str) -> Result<(), String> {
+        let mut port = self.open_serial_port()?;
+        let payload = format!("{command}\n");
+        port.write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write command to '{}': {e}", self))?;
+        port.flush()
+            .map_err(|e| format!("failed to flush command to '{}': {e}", self))?;
+        Ok(())
     }
 
-    Ok(out)
-}
+    fn open_serial_port(&self) -> Result<std::fs::File, String> {
+        let port = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.as_path())
+            .map_err(|e| format!("failed to open serial port '{}': {e}", self))?;
 
-pub(crate) fn send_serial_command(port_path: &str, command: &str) -> Result<(), String> {
-    let mut port = open_serial_port(port_path)?;
-    let payload = format!("{command}\n");
-    port.write_all(payload.as_bytes())
-        .map_err(|e| format!("failed to write command to '{port_path}': {e}"))?;
-    port.flush()
-        .map_err(|e| format!("failed to flush command to '{port_path}': {e}"))?;
-    Ok(())
-}
+        configure_serial_port_8n1_115200(port.as_raw_fd())
+            .map_err(|e| format!("failed to configure serial port '{}': {e}", self))?;
 
-fn open_serial_port(port_path: &str) -> Result<std::fs::File, String> {
-    let port = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(port_path)
-        .map_err(|e| format!("failed to open serial port '{port_path}': {e}"))?;
-
-    configure_serial_port_8n1_115200(port.as_raw_fd())
-        .map_err(|e| format!("failed to configure serial port '{port_path}': {e}"))?;
-
-    Ok(port)
+        Ok(port)
+    }
 }

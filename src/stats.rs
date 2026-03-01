@@ -1,5 +1,5 @@
-use crate::device::{list_devices, resolve_device};
-use crate::platform::send_serial_command_and_capture;
+use crate::usb::{list_devices, resolve_device};
+use serde_json::{Map, Number, Value};
 
 pub(crate) fn fetch_stats(
     device_id: Option<&str>,
@@ -7,14 +7,14 @@ pub(crate) fn fetch_stats(
     let devices = list_devices()?;
     let device = resolve_device(devices, device_id)?;
 
-    if device.port.is_empty() {
+    let Some(port) = device.port() else {
         return Err(format!(
             "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.device
+            device.serial()
         ));
-    }
+    };
 
-    let payload = send_serial_command_and_capture(&device.port, "stats")?;
+    let payload = port.send_serial_command_and_capture("stats")?;
     let raw = String::from_utf8_lossy(&payload).to_string();
     let mut entries = parse_stats_entries(&raw)
         .into_iter()
@@ -22,39 +22,52 @@ pub(crate) fn fetch_stats(
         .collect::<Vec<_>>();
 
     for command in ["vbat", "batpct", "temp", "gettime"] {
-        let raw_value =
-            query_metric(&device.port, command).unwrap_or_else(|| "unavailable".to_string());
+        let raw_value = query_metric(port, command).unwrap_or_else(|| "unavailable".to_string());
         for (key, value) in metric_output_entries(command, &raw_value) {
             entries.push((key, value));
         }
     }
 
-    Ok((device.device, entries))
+    Ok((device.serial().to_string(), entries))
 }
 
-fn query_metric(port_path: &str, command: &str) -> Option<String> {
-    let payload = send_serial_command_and_capture(port_path, command).ok()?;
+fn query_metric(port: &crate::platform::SerialPortPath, command: &str) -> Option<String> {
+    let payload = port.send_serial_command_and_capture(command).ok()?;
     let raw = String::from_utf8_lossy(&payload);
     parse_metric_value(command, &raw)
 }
 
 pub(crate) fn parse_stats_entries(raw: &str) -> Vec<(String, String)> {
-    let normalized = raw.replace('\r', "\n");
+    let mut entries = Vec::new();
+    let mut in_stats_block = false;
 
-    normalized
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .skip_while(|line| !line.contains("~stats:"))
-        .skip(1)
-        .take_while(|line| !line.starts_with('~'))
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            let key = k.trim();
-            let value = v.trim();
-            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
-        })
-        .collect()
+    for line in raw.replace('\r', "\n").lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !in_stats_block {
+            if line.contains("~stats:") {
+                in_stats_block = true;
+            }
+            continue;
+        }
+        if line.starts_with('~') {
+            break;
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        entries.push((key.to_string(), value.to_string()));
+    }
+
+    entries
 }
 
 pub(crate) fn normalize_stat(key: &str, value: &str) -> (String, String) {
@@ -197,38 +210,51 @@ pub(crate) fn split_time_fields(value: &str) -> (String, String) {
 }
 
 pub(crate) fn print_stats_json(entries: &[(String, String)]) {
-    println!("{{");
-    for (idx, (k, v)) in entries.iter().enumerate() {
-        let comma = if idx + 1 < entries.len() { "," } else { "" };
-        if k.starts_with("cpu_") && k.ends_with("_percent") {
-            if let Ok(f) = v.parse::<f64>() {
-                if f.is_finite() {
-                    println!("  \"{}\": {:.1}{}", escape_json(k), f, comma);
-                    continue;
-                }
-            }
-        }
-        if k == "battery_percent" {
-            if let Ok(f) = v.parse::<f64>() {
-                if f.is_finite() {
-                    println!("  \"{}\": {:.2}{}", escape_json(k), f, comma);
-                    continue;
-                }
-            }
-        }
-        if let Ok(i) = v.parse::<i64>() {
-            println!("  \"{}\": {}{}", escape_json(k), i, comma);
-            continue;
-        }
-        if let Ok(f) = v.parse::<f64>() {
-            if f.is_finite() {
-                println!("  \"{}\": {}{}", escape_json(k), f, comma);
-                continue;
-            }
-        }
-        println!("  \"{}\": \"{}\"{}", escape_json(k), escape_json(v), comma);
+    let mut object = Map::with_capacity(entries.len());
+    for (key, value) in entries {
+        object.insert(key.clone(), infer_json_value(key, value));
     }
-    println!("}}");
+
+    let json = serde_json::to_string_pretty(&Value::Object(object))
+        .expect("serializing stats map should not fail");
+    println!("{json}");
+}
+
+fn infer_json_value(key: &str, value: &str) -> Value {
+    if key.starts_with("cpu_") && key.ends_with("_percent") {
+        if let Ok(parsed) = value.parse::<f64>() {
+            if parsed.is_finite() {
+                let rounded = (parsed * 10.0).round() / 10.0;
+                if let Some(number) = Number::from_f64(rounded) {
+                    return Value::Number(number);
+                }
+            }
+        }
+    }
+
+    if key == "battery_percent" {
+        if let Ok(parsed) = value.parse::<f64>() {
+            if parsed.is_finite() {
+                let rounded = (parsed * 100.0).round() / 100.0;
+                if let Some(number) = Number::from_f64(rounded) {
+                    return Value::Number(number);
+                }
+            }
+        }
+    }
+
+    if let Ok(parsed) = value.parse::<i64>() {
+        return Value::Number(parsed.into());
+    }
+    if let Ok(parsed) = value.parse::<f64>() {
+        if parsed.is_finite() {
+            if let Some(number) = Number::from_f64(parsed) {
+                return Value::Number(number);
+            }
+        }
+    }
+
+    Value::String(value.to_string())
 }
 
 fn extract_first_float(s: &str) -> Option<f64> {
@@ -241,19 +267,6 @@ fn extract_first_int(s: &str) -> Option<i64> {
     s.split(|c: char| !(c.is_ascii_digit() || c == '-'))
         .filter(|token| !token.is_empty() && *token != "-")
         .find_map(|token| token.parse::<i64>().ok())
-}
-
-fn escape_json(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            _ => vec![c],
-        })
-        .collect()
 }
 
 #[cfg(test)]

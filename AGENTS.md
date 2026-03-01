@@ -10,8 +10,9 @@
 - `cargo run -- device eject`: Eject mounted data disk.
 - `cargo run -- device stats --json`: Read runtime/device stats as JSON.
 - `cargo run -- device screenshot -f shot.png --open`: Capture screen and open output.
-- `cargo test`: Run unit tests.
-- `cargo fmt`: Format code before commit.
+- `cargo test -q`: Run unit tests.
+- `cargo fmt -q`: Format code before commit.
+- `cargo check -q`: Check to insure no warnings
 
 ## Coding Style & Naming Conventions
 

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
+use std::path::Path;
 use std::process::Command;
+
+use super::SerialPortPath;
+use super::unix::{list_mounts_via_mount_command, list_serial_ports_from_dev};
 
 pub(crate) fn open_with_default_viewer(path: &str) -> Result<(), String> {
     let status = Command::new("xdg-open")
@@ -13,13 +16,13 @@ pub(crate) fn open_with_default_viewer(path: &str) -> Result<(), String> {
     Err(format!("xdg-open failed for '{path}'"))
 }
 
-pub(crate) fn eject_target(_disk: &str, mount_path: &str) -> Result<(), String> {
-    if mount_path.is_empty() {
+pub(crate) fn eject_target(mount_path: Option<&Path>) -> Result<(), String> {
+    let Some(mount_path) = mount_path else {
         return Err("device is not mounted; cannot eject on this platform".to_string());
-    }
+    };
 
     let output = Command::new("umount")
-        .arg(mount_path)
+        .arg(mount_path.as_os_str())
         .output()
         .map_err(|e| format!("failed to run umount: {e}"))?;
 
@@ -28,56 +31,18 @@ pub(crate) fn eject_target(_disk: &str, mount_path: &str) -> Result<(), String> 
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!("failed to unmount '{mount_path}': {stderr}"))
+    Err(format!(
+        "failed to unmount '{}': {stderr}",
+        mount_path.display()
+    ))
 }
 
-pub(crate) fn list_serial_ports() -> Vec<String> {
-    let mut ports = Vec::new();
-
-    let entries = match fs::read_dir("/dev") {
-        Ok(entries) => entries,
-        Err(_) => return ports,
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        let is_usb_serial = name.starts_with("cu.usbmodem")
-            || name.starts_with("tty.usbmodem")
-            || name.starts_with("ttyACM")
-            || name.starts_with("ttyUSB");
-
-        if is_usb_serial {
-            ports.push(format!("/dev/{name}"));
-        }
-    }
-
-    ports.sort();
-    ports
+pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
+    list_serial_ports_from_dev()
 }
 
 pub(crate) fn list_mounts() -> Result<Vec<(String, String)>, String> {
-    let output = Command::new("mount")
-        .output()
-        .map_err(|e| format!("failed to run mount: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("mount failed: {stderr}"));
-    }
-
-    let text = String::from_utf8(output.stdout)
-        .map_err(|e| format!("mount returned non-UTF8 output: {e}"))?;
-
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let (source, rest) = line.split_once(" on ")?;
-            let (target, _) = rest.split_once(" (")?;
-            Some((source.trim().to_string(), target.trim().to_string()))
-        })
-        .collect())
+    list_mounts_via_mount_command()
 }
 
 pub(crate) fn list_playdate_disks_by_serial() -> Result<HashMap<String, Vec<String>>, String> {
