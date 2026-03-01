@@ -1,9 +1,40 @@
-## Playdate Lua SDK Docs
+# Repository Guidelines
 
-[PlaydateSDK Docs Index]|root: ./.playdate-docs
-|IMPORTANT: Prefer retrieval-led reasoning over pre-training-led reasoning
-|{class.md,json.md,playdate.md,print.md,profiling.md,table.md}
-|playdate/{accelerometer.md,datastore.md,device.md,display.md,easingFunctions.md,file.md,frameTimer.md,geometry.md,graphics.md,input.md,inputhandlers.md,keyboard.md,lifecycle.md,math.md,menu.md,mirror.md,network.md,pathfinder.md,profiling.md,scoreboards.md,settings.md,simulator.md,sound.md,string.md,time.md,timer.md,ui.md}
-|playdate/geometry/{affineTransform.md,arc.md,lineSegment.md,point.md,polygon.md,rect.md,size.md,vector2D.md}
-|playdate/graphics/{animation.md,animator.md,font.md,image.md,imagetable.md,nineSlice.md,perlin.md,qrcode.md,sprite.md,tilemap.md,video.md}
-|playdate/sound/{bitcrusher.md,channel.md,controlsignal.md,delayline.md,delaylinetap.md,envelope.md,fileplayer.md,instrument.md,lfo.md,micinput.md,onepolefilter.md,overdrive.md,ringmod.md,sample.md,sampleplayer.md,sequence.md,signal.md,signalvalue.md,synth.md,track.md,twopolefilter.md}
+## Project Structure & Module Organization
+
+- `src/main.rs`: Primary Rust CLI entrypoint for `pd` (crate `peed`), including command parsing, USB discovery (`nusb`), mount/eject logic, and serial command dispatch.
+- `Cargo.toml` / `Cargo.lock`: Rust dependencies and build metadata.
+
+## Build, Test, and Development Commands
+
+- `cargo test`: Run unit tests in `src/main.rs`.
+- `cargo fmt`: Format Rust code; run before committing.
+
+## Coding Style & Naming Conventions
+
+- Follow Rust 2024 idioms and keep code `rustfmt`-clean.
+- Use `snake_case` for functions/variables, `SCREAMING_SNAKE_CASE` for constants, and `CamelCase` for types/enums.
+- Keep CLI errors actionable (`what failed` + `how to recover`).
+
+## Testing Guidelines
+
+- Add tests for:
+  - CLI argument parsing (new commands/flags),
+  - USB/mount parsing behavior,
+  - Device selection and normalization logic.
+- Test names should describe behavior, e.g. `parses_device_mount_alias_command`.
+
+## Commit & Pull Request Guidelines
+
+- Follow current history style: short, imperative commit subjects (examples: `Eject support`, `Add mount discovery`).
+- Keep commits focused (one logical change per commit when possible).
+- PRs should include:
+  - What changed and why,
+  - Exact commands used for verification,
+  - Any hardware assumptions (Playdate mode, mounted/unmounted state),
+  - Sample CLI output for new commands.
+
+## Security & Device Safety Notes
+
+- Serial commands execute on physical hardware; avoid dangerous commands in automated scripts.
+- Validate target serial before destructive operations (`eject`, `factoryreset`, formatting-related commands).
