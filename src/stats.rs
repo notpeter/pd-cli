@@ -1,12 +1,7 @@
-use crate::usb::{list_devices, resolve_device};
+use crate::device::Device;
 use serde_json::{Map, Number, Value};
 
-pub(crate) fn fetch_stats(
-    device_id: Option<&str>,
-) -> Result<(String, Vec<(String, String)>), String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
+pub(crate) fn fetch_stats(device: &Device) -> Result<(String, Vec<(String, String)>), String> {
     let Some(port) = device.port() else {
         return Err(format!(
             "device '{}' has no serial port available; reconnect in serial mode and try again",

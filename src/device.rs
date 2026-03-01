@@ -75,6 +75,14 @@ impl Device {
     pub(crate) fn mounted(&self) -> bool {
         self.mount_path.is_some()
     }
+
+    pub(crate) fn set_mount_path(&mut self, mount_path: PathBuf) {
+        self.mount_path = Some(mount_path);
+    }
+
+    pub(crate) fn clear_mount_path(&mut self) {
+        self.mount_path = None;
+    }
 }
 
 impl fmt::Display for Device {

@@ -113,12 +113,12 @@ mod tests {
 
     #[test]
     fn parses_mount_with_open_flag() {
-        let parsed = Cli::try_parse_from(["pd", "device", "-d", "PDU1-Y013705", "mount", "--open"])
+        let parsed = Cli::try_parse_from(["pd", "device", "-d", "PDU1-Y012345", "mount", "--open"])
             .expect("mount parse should succeed");
         assert_eq!(
             map_parsed_device_command(parsed),
             DeviceCommand::Mount {
-                device_id: Some("PDU1-Y013705".to_string()),
+                device_id: Some("PDU1-Y012345".to_string()),
                 open: true
             }
         );

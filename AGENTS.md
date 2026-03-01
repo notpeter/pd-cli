@@ -29,7 +29,7 @@
   - CLI parsing (`-d`, `--json`, `--open`, `-f` combinations),
   - serial/mount parsing helpers,
   - stats normalization keys/types (e.g., `cpu_*_percent`, `time_epoch`).
-- Use behavior-first names, e.g. `parses_stats_command_with_json`.
+- For Playdae Serial number placeholders use `Y012345` or `Y098765`
 
 ## Commit & Pull Request Guidelines
 - Use short, imperative commit titles (examples from history: `Add support for serial device commands`, `Eject support`).

@@ -1,3 +1,4 @@
+use crate::command::DeviceSelector;
 use crate::device::{Device, DeviceList, DeviceSerial};
 use crate::platform::{
     SerialPortPath, build_disk_mounts, eject_target, list_mounts, list_playdate_disks_by_serial,
@@ -6,6 +7,7 @@ use crate::platform::{
 use crate::{PLAYDATE_PRODUCT_ID_APP, PLAYDATE_PRODUCT_ID_MSC, PLAYDATE_VENDOR_ID};
 use nusb::MaybeFuture;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const MOUNT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
@@ -13,25 +15,19 @@ const MOUNT_WAIT_POLL: Duration = Duration::from_millis(250);
 
 pub(crate) fn resolve_device(
     devices: DeviceList,
-    device_id: Option<&str>,
+    device: &DeviceSelector,
 ) -> Result<Device, String> {
-    match device_id {
-        Some(id) => {
-            let needle = DeviceSerial::parse(id).ok_or_else(|| {
-                format!("invalid device serial '{id}'; expected forms like PDU1-Y013705 or Y013705")
-            })?;
-
-            devices
-                .0
-                .into_iter()
-                .find(|device| device.serial() == &needle)
-                .ok_or_else(|| {
-                    format!(
-                        "device '{id}' not found; run `pd device list` to see available devices"
-                    )
-                })
-        }
-        None => {
+    match device {
+        DeviceSelector::BySerial(needle) => devices
+            .0
+            .into_iter()
+            .find(|candidate| candidate.serial() == needle)
+            .ok_or_else(|| {
+                format!(
+                    "device '{needle}' not found; run `pd device list` to see available devices"
+                )
+            }),
+        DeviceSelector::Auto => {
             let mut devices = devices.0;
             match devices.len() {
                 0 => Err("no Playdate devices found".to_string()),
@@ -44,81 +40,34 @@ pub(crate) fn resolve_device(
     }
 }
 
-pub(crate) fn list_devices() -> Result<DeviceList, String> {
-    let serial_ports = list_serial_ports();
-    let mounts = list_mounts().map_err(|e| format!("failed to list mounts: {e}"))?;
-    let disk_mounts = build_disk_mounts(&mounts)?;
-    let serial_to_disks = list_playdate_disks_by_serial()
-        .map_err(|e| format!("failed to resolve Playdate disks by serial: {e}"))?;
-
-    let usb_devices = nusb::list_devices()
-        .wait()
-        .map_err(|e| format!("failed to list USB devices: {e}"))?;
-
-    let mut devices = Vec::new();
-    for usb in usb_devices {
-        if usb.vendor_id() != PLAYDATE_VENDOR_ID
-            || (usb.product_id() != PLAYDATE_PRODUCT_ID_MSC
-                && usb.product_id() != PLAYDATE_PRODUCT_ID_APP)
-        {
-            continue;
-        }
-
-        let Some(serial) = usb.serial_number().and_then(DeviceSerial::parse) else {
-            continue;
-        };
-
-        let port = find_port_for_serial(&serial_ports, &serial);
-        let mount_path =
-            find_mount_path_for_serial(&serial, &serial_to_disks, &disk_mounts).map(Into::into);
-
-        devices.push(Device::new(serial, port, mount_path));
-    }
-
-    devices.sort_by(|a, b| a.serial().cmp(b.serial()));
-    devices.dedup_by(|a, b| a.serial() == b.serial());
-    Ok(DeviceList(devices))
+pub(crate) fn resolve_selected_device(device: &DeviceSelector) -> Result<Device, String> {
+    let devices = DeviceList::discover()?;
+    resolve_device(devices, device)
 }
 
-pub(crate) fn send_serial_command_to_device(
-    device_id: Option<&str>,
-    command: &str,
-) -> Result<(String, String), String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
-    let Some(port) = device.port() else {
-        return Err(format!(
-            "device '{}' has no serial port available; reconnect in serial mode and try again",
-            device.serial()
-        ));
-    };
-
-    port.send_serial_command(command)?;
-    Ok((device.serial().to_string(), port.to_string()))
-}
-
-pub(crate) fn mount_device(device_id: Option<&str>) -> Result<(String, String), String> {
+pub(crate) fn resolve_mount_target(device: &DeviceSelector) -> Result<Device, String> {
     let start = Instant::now();
 
     loop {
-        let devices = list_devices()?;
-        match devices.select_mount_target(device_id)? {
-            Some(device) => {
-                let serial = device.serial().to_string();
-                if let Some(port) = device.port() {
-                    port.send_serial_command("datadisk")?;
-                }
+        let devices = DeviceList::discover()?;
+        let device = match device {
+            DeviceSelector::BySerial(needle) => devices
+                .as_slice()
+                .iter()
+                .find(|candidate| candidate.serial() == needle)
+                .cloned(),
+            DeviceSelector::Auto => match devices.as_slice().len() {
+                0 => None,
+                1 => Some(devices.as_slice()[0].clone()),
+                _ => return Err("multiple devices found; specify with `-d <serial>`".to_string()),
+            },
+        };
 
-                let mount_path = device.wait_for_mount_ready()?;
-                return Ok((serial, mount_path));
-            }
+        match device {
+            Some(device) => return Ok(device),
             None => {
                 if Instant::now().duration_since(start) >= MOUNT_WAIT_TIMEOUT {
-                    return Err(
-                        "timed out waiting for device before mount: no Playdate devices found"
-                            .to_string(),
-                    );
+                    return Err("timeout waiting for device mount: no devices found".to_string());
                 }
             }
         }
@@ -127,18 +76,15 @@ pub(crate) fn mount_device(device_id: Option<&str>) -> Result<(String, String), 
     }
 }
 
-pub(crate) fn eject_device(device_id: Option<&str>) -> Result<String, String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
-    device.eject_device()?;
-
-    Ok(device.serial().to_string())
-}
-
 impl Device {
-    pub(crate) fn eject_device(&self) -> Result<(), String> {
-        eject_target(self.mount_path())
+    pub(crate) fn send_command(&self, command: &str) -> Result<(String, String), String> {
+        let Some(port) = self.port() else {
+            return Err(format!(
+                "{self} has no serial port available; is the disk mounted?"
+            ));
+        };
+        port.send_serial_command(command)?;
+        Ok((self.serial().to_string(), port.to_string()))
     }
 
     pub(crate) fn wait_for_mount_ready(&self) -> Result<String, String> {
@@ -172,31 +118,59 @@ impl Device {
             std::thread::sleep(MOUNT_WAIT_POLL);
         }
     }
+
+    pub(crate) fn mount_device(&mut self) -> Result<(), String> {
+        if let Some(port) = self.port() {
+            port.send_serial_command("datadisk")?;
+        }
+
+        let mount_path = self.wait_for_mount_ready()?;
+        self.set_mount_path(PathBuf::from(mount_path));
+        Ok(())
+    }
+
+    pub(crate) fn eject_device(&mut self) -> Result<(), String> {
+        eject_target(self.mount_path())?;
+        self.clear_mount_path();
+        Ok(())
+    }
 }
 
 impl DeviceList {
-    fn select_mount_target(&self, device_id: Option<&str>) -> Result<Option<Device>, String> {
-        match device_id {
-            Some(id) => {
-                let needle = DeviceSerial::parse(id).ok_or_else(|| {
-                    format!(
-                        "invalid device serial '{id}'; expected forms like PDU1-Y013705 or Y013705"
-                    )
-                })?;
-                Ok(self
-                    .as_slice()
-                    .iter()
-                    .find(|device| device.serial() == &needle)
-                    .cloned())
+    pub(crate) fn discover() -> Result<Self, String> {
+        let serial_ports = list_serial_ports();
+        let mounts = list_mounts().map_err(|e| format!("failed to list mounts: {e}"))?;
+        let disk_mounts = build_disk_mounts(&mounts)?;
+        let serial_to_disks = list_playdate_disks_by_serial()
+            .map_err(|e| format!("failed to resolve Playdate disks by serial: {e}"))?;
+
+        let usb_devices = nusb::list_devices()
+            .wait()
+            .map_err(|e| format!("failed to list USB devices: {e}"))?;
+
+        let mut devices = Vec::new();
+        for usb in usb_devices {
+            if usb.vendor_id() != PLAYDATE_VENDOR_ID
+                || (usb.product_id() != PLAYDATE_PRODUCT_ID_MSC
+                    && usb.product_id() != PLAYDATE_PRODUCT_ID_APP)
+            {
+                continue;
             }
-            None => match self.as_slice().len() {
-                0 => Ok(None),
-                1 => Ok(Some(self.as_slice()[0].clone())),
-                _ => Err(
-                    "multiple Playdate devices found; specify one with `-d <serial>`".to_string(),
-                ),
-            },
+
+            let Some(serial) = usb.serial_number().and_then(DeviceSerial::parse) else {
+                continue;
+            };
+
+            let port = find_port_for_serial(&serial_ports, &serial);
+            let mount_path =
+                find_mount_path_for_serial(&serial, &serial_to_disks, &disk_mounts).map(Into::into);
+
+            devices.push(Device::new(serial, port, mount_path));
         }
+
+        devices.sort_by(|a, b| a.serial().cmp(b.serial()));
+        devices.dedup_by(|a, b| a.serial() == b.serial());
+        Ok(DeviceList(devices))
     }
 }
 

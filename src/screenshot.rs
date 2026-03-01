@@ -1,8 +1,7 @@
+use crate::device::Device;
 use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Luma};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::usb::{list_devices, resolve_device};
 
 const SCREEN_PREFIX: &[u8] = b"screen\r\n~screen:\n";
 const SCREEN_PREFIX_LEGACY: &[u8] = b"\r\nscreen~:\n";
@@ -11,12 +10,9 @@ const SCREEN_WIDTH: u32 = 400;
 const SCREEN_HEIGHT: u32 = 240;
 
 pub(crate) fn capture_screenshot(
-    device_id: Option<&str>,
-    filename: Option<&str>,
+    device: &Device,
+    filename: Option<PathBuf>,
 ) -> Result<(String, String, usize, String), String> {
-    let devices = list_devices()?;
-    let device = resolve_device(devices, device_id)?;
-
     let Some(port) = device.port() else {
         return Err(format!(
             "device '{}' has no serial port available; reconnect in serial mode and try again",
@@ -25,23 +21,28 @@ pub(crate) fn capture_screenshot(
     };
 
     let payload = port.send_serial_command_and_capture("screen")?;
-    let path = filename
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(default_screenshot_filename);
+    let path = filename.unwrap_or_else(|| PathBuf::from(default_screenshot_filename()));
     write_screenshot_file(&path, &payload)?;
 
     let inspect = inspect_screen_payload(&payload, &path);
-    Ok((device.serial().to_string(), path, payload.len(), inspect))
+    Ok((
+        device.serial().to_string(),
+        path.display().to_string(),
+        payload.len(),
+        inspect,
+    ))
 }
 
-fn write_screenshot_file(path: &str, payload: &[u8]) -> Result<(), String> {
+fn write_screenshot_file(path: &Path, payload: &[u8]) -> Result<(), String> {
     match screenshot_format_for_path(path)? {
         Some(ImageFormat::Png) => {
             let bitmap = extract_screen_bitmap(payload)?;
             let image = bitmap_to_image(bitmap);
             DynamicImage::ImageLuma8(image)
                 .save_with_format(path, ImageFormat::Png)
-                .map_err(|e| format!("failed to write screenshot image '{path}': {e}"))?;
+                .map_err(|e| {
+                    format!("failed to write screenshot image '{}': {e}", path.display())
+                })?;
             Ok(())
         }
         Some(ImageFormat::Gif) => {
@@ -50,17 +51,19 @@ fn write_screenshot_file(path: &str, payload: &[u8]) -> Result<(), String> {
             DynamicImage::ImageLuma8(image)
                 .into_rgb8()
                 .save_with_format(path, ImageFormat::Gif)
-                .map_err(|e| format!("failed to write screenshot image '{path}': {e}"))?;
+                .map_err(|e| {
+                    format!("failed to write screenshot image '{}': {e}", path.display())
+                })?;
             Ok(())
         }
         Some(other) => Err(format!("unsupported image output format: {other:?}")),
         None => std::fs::write(path, payload)
-            .map_err(|e| format!("failed to write screenshot file '{path}': {e}")),
+            .map_err(|e| format!("failed to write screenshot file '{}': {e}", path.display())),
     }
 }
 
-fn screenshot_format_for_path(path: &str) -> Result<Option<ImageFormat>, String> {
-    let ext = Path::new(path)
+fn screenshot_format_for_path(path: &Path) -> Result<Option<ImageFormat>, String> {
+    let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
@@ -139,7 +142,7 @@ fn timestamp_now() -> String {
     secs.to_string()
 }
 
-fn inspect_screen_payload(payload: &[u8], path: &str) -> String {
+fn inspect_screen_payload(payload: &[u8], path: &Path) -> String {
     if let Some(offset) = find_subslice(payload, SCREEN_PREFIX)
         .or_else(|| find_subslice(payload, SCREEN_PREFIX_LEGACY))
     {
@@ -170,7 +173,7 @@ fn inspect_screen_payload(payload: &[u8], path: &str) -> String {
     )
 }
 
-fn screenshot_kind_for_path(path: &str) -> &'static str {
+fn screenshot_kind_for_path(path: &Path) -> &'static str {
     match screenshot_format_for_path(path) {
         Ok(Some(ImageFormat::Png)) => "PNG image",
         Ok(Some(ImageFormat::Gif)) => "GIF image",
