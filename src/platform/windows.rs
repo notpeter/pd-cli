@@ -23,7 +23,43 @@ pub(crate) fn eject_target(_mount_path: Option<&Path>) -> Result<(), String> {
 }
 
 pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
-    Vec::new()
+    let wmi = match init_wmi() {
+        Ok(wmi) => wmi,
+        Err(_) => return Vec::new(),
+    };
+
+    let query = "SELECT DeviceID, PNPDeviceID FROM Win32_SerialPort \
+                 WHERE PNPDeviceID LIKE '%VID_1331&PID_5740%' \
+                    OR PNPDeviceID LIKE '%VID_1331&PID_5741%'";
+
+    let rows: Vec<SerialPortRow> = match wmi.raw_query(query) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut ports = Vec::new();
+    for row in rows {
+        let Some(pnp_device_id) = row.pnp_device_id.as_deref() else {
+            continue;
+        };
+        let Some(serial) = parse_serial_from_pnp_device_id(pnp_device_id) else {
+            continue;
+        };
+
+        let device_id = row.device_id.trim();
+        if device_id.is_empty() {
+            continue;
+        }
+
+        ports.push(SerialPortPath::with_device_serial_core(
+            device_id.into(),
+            serial.core().to_string(),
+        ));
+    }
+
+    ports.sort();
+    ports.dedup();
+    ports
 }
 
 pub(crate) fn list_mounts() -> Result<Vec<(String, String)>, String> {
@@ -192,6 +228,14 @@ struct DiskPartitionRow {
 #[serde(rename_all = "PascalCase")]
 struct LogicalDiskRow {
     device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SerialPortRow {
+    device_id: String,
+    #[serde(default)]
+    pnp_device_id: Option<String>,
 }
 
 impl SerialPortPath {

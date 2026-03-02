@@ -11,22 +11,40 @@ mod unix;
 mod windows;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SerialPortPath(PathBuf);
+pub(crate) struct SerialPortPath {
+    path: PathBuf,
+    device_serial_core: Option<String>,
+}
 
 impl SerialPortPath {
     #[allow(dead_code)]
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self(path)
+        Self {
+            path,
+            device_serial_core: None,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn with_device_serial_core(path: PathBuf, device_serial_core: String) -> Self {
+        Self {
+            path,
+            device_serial_core: Some(device_serial_core.to_ascii_uppercase()),
+        }
     }
 
     pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    pub(crate) fn device_serial_core(&self) -> Option<&str> {
+        self.device_serial_core.as_deref()
     }
 }
 
 impl fmt::Display for SerialPortPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.display())
+        write!(f, "{}", self.path.display())
     }
 }
 

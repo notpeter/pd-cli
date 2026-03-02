@@ -186,6 +186,10 @@ fn find_port_for_serial(
 
 impl SerialPortPath {
     fn contains_device_serial(&self, serial: &DeviceSerial) -> bool {
+        if let Some(core) = self.device_serial_core() {
+            return core == serial.core();
+        }
+
         let Some(name) = self.as_path().file_name().and_then(|name| name.to_str()) else {
             return false;
         };
@@ -236,5 +240,17 @@ mod tests {
         let ports = vec![SerialPortPath::new(path)];
         let port = find_port_for_serial(&ports, &serial).expect("port should resolve");
         assert_eq!(port.to_string(), "/dev/cu.usbmodemPDU1_Y0137051");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn matches_windows_port_by_serial_hint() {
+        let serial = DeviceSerial::parse("Y012345").expect("valid serial");
+        let ports = vec![SerialPortPath::with_device_serial_core(
+            PathBuf::from("COM7"),
+            "Y012345".to_string(),
+        )];
+        let port = find_port_for_serial(&ports, &serial).expect("port should resolve");
+        assert_eq!(port.to_string(), "COM7");
     }
 }
