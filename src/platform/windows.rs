@@ -1,8 +1,9 @@
 use crate::device::DeviceSerial;
-use serde_json::Value;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use wmi::{COMLibrary, WMIConnection};
 
 use super::SerialPortPath;
 
@@ -26,69 +27,75 @@ pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
 }
 
 pub(crate) fn list_mounts() -> Result<Vec<(String, String)>, String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-Get-Partition |
-  Where-Object { $_.DriveLetter } |
-  Select-Object DiskNumber, DriveLetter |
-  ConvertTo-Json -Compress
-"#;
-
-    let json = match run_powershell(script) {
-        Ok(out) => out,
+    let wmi = match init_wmi() {
+        Ok(wmi) => wmi,
         Err(_) => return Ok(Vec::new()),
     };
 
-    let Some(rows) = parse_json_rows(&json) else {
-        return Ok(Vec::new());
-    };
+    let disks: Vec<LogicalDiskRow> =
+        match wmi.raw_query("SELECT DeviceID FROM Win32_LogicalDisk WHERE DeviceID IS NOT NULL") {
+            Ok(rows) => rows,
+            Err(_) => return Ok(Vec::new()),
+        };
 
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let disk_number = row.get("DiskNumber")?.as_u64()?;
-            let drive_letter = row.get("DriveLetter")?.as_str()?;
-            let source = format!("disk{disk_number}");
-            let target = format!("{drive_letter}:\\");
-            Some((source, target))
-        })
-        .collect())
+    let mut mounts = Vec::new();
+    for disk in disks {
+        let Some(source) = normalize_drive_id(&disk.device_id) else {
+            continue;
+        };
+        mounts.push((source.clone(), format!("{source}\\")));
+    }
+
+    mounts.sort();
+    mounts.dedup();
+    Ok(mounts)
 }
 
 pub(crate) fn list_playdate_disks_by_serial() -> Result<HashMap<String, Vec<String>>, String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-Get-CimInstance Win32_DiskDrive |
-  Where-Object { $_.PNPDeviceID -match 'VID_1331&PID_574[01]' } |
-  Select-Object PNPDeviceID,DeviceID,Index |
-  ConvertTo-Json -Compress
-"#;
-
-    let json = match run_powershell(script) {
-        Ok(out) => out,
+    let wmi = match init_wmi() {
+        Ok(wmi) => wmi,
         Err(_) => return Ok(HashMap::new()),
     };
 
-    let Some(rows) = parse_json_rows(&json) else {
-        return Ok(HashMap::new());
+    let query = "SELECT PNPDeviceID, DeviceID FROM Win32_DiskDrive \
+                 WHERE PNPDeviceID LIKE '%VID_1331&PID_5740%' \
+                    OR PNPDeviceID LIKE '%VID_1331&PID_5741%'";
+
+    let drives: Vec<DiskDriveRow> = match wmi.raw_query(query) {
+        Ok(rows) => rows,
+        Err(_) => return Ok(HashMap::new()),
     };
 
     let mut by_serial: HashMap<String, Vec<String>> = HashMap::new();
-    for row in &rows {
-        let Some(pnp_id) = row.get("PNPDeviceID").and_then(Value::as_str) else {
+    for drive in drives {
+        let Some(pnp_id) = drive.pnp_device_id.as_deref() else {
             continue;
         };
         let Some(serial) = parse_serial_from_pnp_device_id(pnp_id) else {
             continue;
         };
-        let Some(disk) = parse_disk_key(row) else {
-            continue;
+
+        let partitions = match query_partitions_for_disk(&wmi, &drive.device_id) {
+            Ok(rows) => rows,
+            Err(_) => continue,
         };
 
-        by_serial
-            .entry(serial.core().to_string())
-            .or_default()
-            .push(disk);
+        for partition in partitions {
+            let logical_disks = match query_logical_disks_for_partition(&wmi, &partition.device_id)
+            {
+                Ok(rows) => rows,
+                Err(_) => continue,
+            };
+            for logical_disk in logical_disks {
+                let Some(drive_id) = normalize_drive_id(&logical_disk.device_id) else {
+                    continue;
+                };
+                by_serial
+                    .entry(serial.core().to_string())
+                    .or_default()
+                    .push(drive_id);
+            }
+        }
     }
 
     for disks in by_serial.values_mut() {
@@ -105,7 +112,7 @@ pub(crate) fn build_disk_mounts(
     let mut by_disk = HashMap::new();
 
     for (source, target) in mounts {
-        if !source.starts_with("disk") {
+        if normalize_drive_id(source).is_none() {
             continue;
         }
         by_disk
@@ -116,33 +123,33 @@ pub(crate) fn build_disk_mounts(
     Ok(by_disk)
 }
 
-fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|e| format!("failed to run powershell: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("powershell failed: {stderr}"));
-    }
-
-    String::from_utf8(output.stdout)
-        .map(|text| text.trim().to_string())
-        .map_err(|e| format!("powershell returned non-UTF8 output: {e}"))
+fn init_wmi() -> Result<WMIConnection, String> {
+    let com = COMLibrary::new().map_err(|e| format!("failed to initialize COM: {e}"))?;
+    WMIConnection::new(com.into()).map_err(|e| format!("failed to connect to WMI: {e}"))
 }
 
-fn parse_json_rows(json: &str) -> Option<Vec<Value>> {
-    if json.trim().is_empty() {
-        return Some(Vec::new());
-    }
+fn query_partitions_for_disk(
+    wmi: &WMIConnection,
+    disk_device_id: &str,
+) -> Result<Vec<DiskPartitionRow>, String> {
+    let query = format!(
+        "ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{}'}} WHERE AssocClass = Win32_DiskDriveToDiskPartition",
+        wql_escape(disk_device_id)
+    );
+    wmi.raw_query(&query)
+        .map_err(|e| format!("failed to query disk partitions: {e}"))
+}
 
-    let parsed: Value = serde_json::from_str(json).ok()?;
-    match parsed {
-        Value::Array(values) => Some(values),
-        Value::Object(_) => Some(vec![parsed]),
-        _ => None,
-    }
+fn query_logical_disks_for_partition(
+    wmi: &WMIConnection,
+    partition_device_id: &str,
+) -> Result<Vec<LogicalDiskRow>, String> {
+    let query = format!(
+        "ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{}'}} WHERE AssocClass = Win32_LogicalDiskToPartition",
+        wql_escape(partition_device_id)
+    );
+    wmi.raw_query(&query)
+        .map_err(|e| format!("failed to query logical disks: {e}"))
 }
 
 fn parse_serial_from_pnp_device_id(pnp_device_id: &str) -> Option<DeviceSerial> {
@@ -151,18 +158,40 @@ fn parse_serial_from_pnp_device_id(pnp_device_id: &str) -> Option<DeviceSerial> 
     DeviceSerial::parse(before_ampersand)
 }
 
-fn parse_disk_key(row: &Value) -> Option<String> {
-    if let Some(index) = row.get("Index").and_then(Value::as_u64) {
-        return Some(format!("disk{index}"));
+fn normalize_drive_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 2 {
+        return None;
     }
+    let bytes = trimmed.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return None;
+    }
+    Some(trimmed[..2].to_ascii_uppercase())
+}
 
-    let device_id = row.get("DeviceID").and_then(Value::as_str)?;
-    let disk_number = device_id
-        .rsplit("PHYSICALDRIVE")
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    Some(format!("disk{disk_number}"))
+fn wql_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DiskDriveRow {
+    #[serde(default)]
+    pnp_device_id: Option<String>,
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DiskPartitionRow {
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LogicalDiskRow {
+    device_id: String,
 }
 
 impl SerialPortPath {
@@ -189,8 +218,7 @@ impl SerialPortPath {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_disk_key, parse_serial_from_pnp_device_id};
-    use serde_json::json;
+    use super::{normalize_drive_id, parse_serial_from_pnp_device_id, wql_escape};
 
     #[test]
     fn parses_playdate_serial_from_windows_pnp_device_id() {
@@ -202,19 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_disk_key_from_index() {
-        let row = json!({
-            "Index": 7,
-            "DeviceID": r"\\.\PHYSICALDRIVE3"
-        });
-        assert_eq!(parse_disk_key(&row), Some("disk7".to_string()));
+    fn normalizes_drive_letter_to_uppercase() {
+        assert_eq!(normalize_drive_id("e:"), Some("E:".to_string()));
+        assert_eq!(normalize_drive_id("C:\\"), Some("C:".to_string()));
     }
 
     #[test]
-    fn parses_disk_key_from_device_id_when_index_missing() {
-        let row = json!({
-            "DeviceID": r"\\.\PHYSICALDRIVE11"
-        });
-        assert_eq!(parse_disk_key(&row), Some("disk11".to_string()));
+    fn escapes_backslashes_and_quotes_for_wql() {
+        assert_eq!(
+            wql_escape(r"\\.\PHYSICALDRIVE3's"),
+            r"\\\\.\\PHYSICALDRIVE3''s"
+        );
     }
 }
