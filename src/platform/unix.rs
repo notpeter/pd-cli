@@ -1,3 +1,4 @@
+use crate::device::DeviceSerial;
 use crate::platform::SerialPortPath;
 use std::collections::HashMap;
 use std::fs;
@@ -56,12 +57,39 @@ pub(crate) fn list_serial_ports_from_dev() -> Vec<SerialPortPath> {
             || name.starts_with("ttyUSB");
 
         if is_usb_serial {
-            ports.push(SerialPortPath::new(format!("/dev/{name}").into()));
+            let Some(device_key) = extract_device_key_from_port_name(&name) else {
+                continue;
+            };
+            ports.push(SerialPortPath::with_device_key(
+                format!("/dev/{name}").into(),
+                device_key,
+            ));
         }
     }
 
     ports.sort();
     ports
+}
+
+fn extract_device_key_from_port_name(name: &str) -> Option<String> {
+    let upper = name.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'Y' {
+            continue;
+        }
+        if start + 7 > bytes.len() {
+            break;
+        }
+        let candidate = &upper[start..start + 7];
+        if !candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if let Some(serial) = DeviceSerial::parse(candidate) {
+            return Some(serial.core().to_string());
+        }
+    }
+    None
 }
 
 pub(crate) fn list_mounts_via_mount_command() -> Result<Vec<(String, String)>, String> {

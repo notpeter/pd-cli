@@ -62,7 +62,7 @@ pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
         }
 
         let device_path = format!(r"\\.\{device_id}");
-        ports.push(SerialPortPath::with_device_serial_core(
+        ports.push(SerialPortPath::new(
             device_path.into(),
             serial.core().to_string(),
         ));
@@ -467,10 +467,7 @@ mod tests {
     #[test]
     fn normalizes_com_port_path_at_discovery() {
         use crate::platform::SerialPortPath;
-        let port = SerialPortPath::with_device_serial_core(
-            format!(r"\\.\COM3").into(),
-            "Y012345".to_string(),
-        );
+        let port = SerialPortPath::new(format!(r"\\.\COM3").into(), "Y012345".to_string());
         assert_eq!(port.to_string(), r"\\.\COM3");
     }
 }

@@ -186,19 +186,7 @@ fn find_port_for_serial(
 
 impl SerialPortPath {
     fn contains_device_serial(&self, serial: &DeviceSerial) -> bool {
-        if let Some(core) = self.device_serial_core() {
-            return core == serial.core();
-        }
-
-        let Some(name) = self.as_path().file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-
-        if name.starts_with("cu.usbmodemPDU1") || name.starts_with("tty.usbmodemPDU1") {
-            let name_upper = name.to_ascii_uppercase();
-            return name_upper.contains(serial.core());
-        }
-        false
+        self.device_key() == serial.core()
     }
 }
 
@@ -233,20 +221,20 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn matches_port_with_interface_suffix_digit() {
+    fn matches_port_by_device_key() {
         let serial = DeviceSerial::parse("Y012345").expect("valid serial");
-        // Note the extra trailing '1'
-        let path = PathBuf::from("/dev/cu.usbmodemPDU1_Y123451");
-        let ports = vec![SerialPortPath::new(path)];
+        let ports = vec![SerialPortPath::new(
+            PathBuf::from("/dev/cu.usbmodemPDU1_Y0123451"),
+            "Y012345".to_string(),
+        )];
         let port = find_port_for_serial(&ports, &serial).expect("port should resolve");
-        assert_eq!(port.to_string(), "/dev/cu.usbmodemPDU1_Y0137051");
+        assert_eq!(port.to_string(), "/dev/cu.usbmodemPDU1_Y0123451");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn matches_windows_port_by_serial_hint() {
+    fn matches_windows_port_by_device_key() {
         let serial = DeviceSerial::parse("Y012345").expect("valid serial");
-        let ports = vec![SerialPortPath::with_device_serial_core(
+        let ports = vec![SerialPortPath::new(
             PathBuf::from(r"\\.\COM7"),
             "Y012345".to_string(),
         )];

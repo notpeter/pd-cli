@@ -13,23 +13,14 @@ mod windows;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SerialPortPath {
     path: PathBuf,
-    device_serial_core: Option<String>,
+    device_key: String,
 }
 
 impl SerialPortPath {
-    #[allow(dead_code)]
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf, device_key: String) -> Self {
         Self {
             path,
-            device_serial_core: None,
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(crate) fn with_device_serial_core(path: PathBuf, device_serial_core: String) -> Self {
-        Self {
-            path,
-            device_serial_core: Some(device_serial_core.to_ascii_uppercase()),
+            device_key: device_key.to_ascii_uppercase(),
         }
     }
 
@@ -37,8 +28,8 @@ impl SerialPortPath {
         &self.path
     }
 
-    pub(crate) fn device_serial_core(&self) -> Option<&str> {
-        self.device_serial_core.as_deref()
+    pub(crate) fn device_key(&self) -> &str {
+        &self.device_key
     }
 }
 
