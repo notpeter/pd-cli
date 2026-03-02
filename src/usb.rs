@@ -190,16 +190,11 @@ impl SerialPortPath {
             return false;
         };
 
-        if let Some(parsed) = DeviceSerial::parse(name) {
-            if &parsed == serial {
-                return true;
-            }
+        if name.starts_with("cu.usbmodemPDU1") || name.starts_with("tty.usbmodemPDU1") {
+            let name_upper = name.to_ascii_uppercase();
+            return name_upper.contains(serial.core());
         }
-
-        name.split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .filter_map(DeviceSerial::parse)
-            .any(|parsed| &parsed == serial)
+        false
     }
 }
 
@@ -224,4 +219,22 @@ fn find_mount_path_for_serial(
 ) -> Option<String> {
     let disks = serial_to_disks.get(serial.core())?;
     disks.iter().find_map(|disk| disk_mounts.get(disk).cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_port_for_serial;
+    use crate::device::DeviceSerial;
+    use crate::platform::SerialPortPath;
+    use std::path::PathBuf;
+
+    #[test]
+    fn matches_port_with_interface_suffix_digit() {
+        let serial = DeviceSerial::parse("Y012345").expect("valid serial");
+        // Note the extra trailing '1'
+        let path = PathBuf::from("/dev/cu.usbmodemPDU1_Y123451");
+        let ports = vec![SerialPortPath::new(path)];
+        let port = find_port_for_serial(&ports, &serial).expect("port should resolve");
+        assert_eq!(port.to_string(), "/dev/cu.usbmodemPDU1_Y0137051");
+    }
 }
