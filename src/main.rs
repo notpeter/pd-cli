@@ -39,12 +39,26 @@ fn run() -> Result<(), String> {
             emit_log(log_format, device.log("Ejected device"));
         }
         Command::Serial { device, command } => {
-            let resolved = get_device(&device)?;
-            resolved.send_command(command.as_str())?;
+            let device = get_device(&device)?;
+            device.send_command(command.as_str())?;
             emit_log(
                 log_format,
-                resolved.log(format!("Sent serial command: {}", command.as_str())),
+                device.log(format!("Sent serial command: {}", command.as_str())),
             );
+        }
+        Command::Input { device, input } => {
+            let device = get_device(&device)?;
+            let serial = input.to_serial_command();
+            device.send_command(serial.as_str())?;
+            let log = device.log(format!("Sent input command: {serial}"));
+            emit_log(log_format, log);
+        }
+        Command::Crank { device, crank } => {
+            let device = get_device(&device)?;
+            let serial = crank.to_serial_command();
+            device.send_command(serial.as_str())?;
+            let log = device.log(format!("Sent crank command: {serial}"));
+            emit_log(log_format, log);
         }
         Command::Mount { device, open } => {
             let mut device = wait_for_selected_device(&device)?;
@@ -53,13 +67,10 @@ fn run() -> Result<(), String> {
                 .mount_path()
                 .map(|path| path.display().to_string())
                 .ok_or_else(|| "mount completed but no mount path was recorded".to_string())?;
-            emit_log(
-                log_format,
-                device.log(format!("Mounted device at {mount_path}")),
-            );
+            let log = device.log(format!("Mounted device at {mount_path}"));
+            emit_log(log_format, log);
             if open {
                 open_with_default_viewer(&mount_path)?;
-                emit_log(log_format, device.log(format!("Opened {mount_path}")));
             }
         }
         Command::Screenshot {
@@ -69,14 +80,11 @@ fn run() -> Result<(), String> {
         } => {
             let device = get_device(&device)?;
             let (_serial, path, bytes, inspect) = capture_screenshot(&device, filename)?;
-            emit_log(
-                log_format,
-                device.log(format!("Captured screenshot to {path} ({bytes} bytes)")),
-            );
+            let log = device.log(format!("Captured screenshot to {path} ({bytes} bytes)"));
+            emit_log(log_format, log);
             emit_log(log_format, device.log(inspect));
             if open {
                 open_with_default_viewer(&path)?;
-                emit_log(log_format, device.log(format!("Opened {path}")));
             }
         }
         Command::Stats { device, json } => {
@@ -91,11 +99,6 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        Command::Hibernate { device } => {
-            let resolved = get_device(&device)?;
-            resolved.send_command("hibernate")?;
-            emit_log(log_format, resolved.log("Sent serial command: hibernate"));
-        }
     }
     Ok(())
 }
@@ -103,6 +106,6 @@ fn run() -> Result<(), String> {
 fn emit_log(log_format: LogFormat, log: DeviceLog) {
     match log_format {
         LogFormat::Text => println!("{log}"),
-        LogFormat::Jsonl => println!("{}", log.to_jsonl()),
+        LogFormat::Json => println!("{}", log.to_json()),
     }
 }

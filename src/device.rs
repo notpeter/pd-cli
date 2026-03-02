@@ -56,7 +56,7 @@ pub(crate) struct DeviceLog {
 
 impl DeviceLog {
     #[allow(dead_code)]
-    pub(crate) fn to_jsonl(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         json!({
             "serial_number": self.serial_number,
             "msg": self.msg,
@@ -200,11 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn device_log_renders_jsonl() {
+    fn device_log_renders_json() {
         let device = Device::new(DeviceSerial::parse("Y012345").unwrap(), None, None);
         let log = device.log("Sent serial command: hibernate");
         assert_eq!(
-            log.to_jsonl(),
+            log.to_json(),
             r#"{"msg":"Sent serial command: hibernate","serial_number":"PDU1-Y012345"}"#
         );
     }

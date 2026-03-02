@@ -1,5 +1,6 @@
 use crate::command::{
-    Command, LogFormat, ParsedCommand, SerialCommand, parse_device_selector,
+    Command, CrankCommand, InputCommand, LogFormat, ParsedCommand, SerialCommand,
+    parse_device_selector,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -36,6 +37,13 @@ enum DeviceSubcommand {
         open: bool,
     },
     Datadisk,
+    Input {
+        input: String,
+    },
+    Crank {
+        #[arg(allow_hyphen_values = true)]
+        crank: String,
+    },
     Serial {
         command: String,
     },
@@ -49,7 +57,6 @@ enum DeviceSubcommand {
         #[arg(long = "open")]
         open: bool,
     },
-    Hibernate,
 }
 
 pub(crate) fn parse_command_from_env() -> Result<ParsedCommand, String> {
@@ -74,6 +81,14 @@ fn map_parsed_cli(parsed: Cli) -> Result<ParsedCommand, String> {
                     device: parse_device_selector(device_id)?,
                     command: SerialCommand::parse("datadisk".to_string())?,
                 },
+                DeviceSubcommand::Input { input } => Command::Input {
+                    device: parse_device_selector(device_id)?,
+                    input: InputCommand::parse(input)?,
+                },
+                DeviceSubcommand::Crank { crank } => Command::Crank {
+                    device: parse_device_selector(device_id)?,
+                    crank: CrankCommand::parse(crank)?,
+                },
                 DeviceSubcommand::Serial { command } => Command::Serial {
                     device: parse_device_selector(device_id)?,
                     command: SerialCommand::parse(command)?,
@@ -86,9 +101,6 @@ fn map_parsed_cli(parsed: Cli) -> Result<ParsedCommand, String> {
                     device: parse_device_selector(device_id)?,
                     filename: filename.map(PathBuf::from),
                     open,
-                },
-                DeviceSubcommand::Hibernate => Command::Hibernate {
-                    device: parse_device_selector(device_id)?,
                 },
             };
             Ok(ParsedCommand {
@@ -124,11 +136,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_jsonl_log_format() {
-        let parsed = Cli::try_parse_from(["pd", "--log-format", "jsonl", "device", "list"])
+    fn parses_json_log_format() {
+        let parsed = Cli::try_parse_from(["pd", "--log-format", "json", "device", "list"])
             .expect("parse should succeed");
         let parsed = map_parsed_cli(parsed).expect("map should succeed");
-        assert_eq!(parsed.log_format, LogFormat::Jsonl);
+        assert_eq!(parsed.log_format, LogFormat::Json);
     }
 
     #[test]
