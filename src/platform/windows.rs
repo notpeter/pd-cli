@@ -3,6 +3,16 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Devices::Communication::{
+    COMMTIMEOUTS, DCB, GetCommState, NOPARITY, ONESTOPBIT, PURGE_RXCLEAR, PURGE_TXCLEAR, PurgeComm,
+    SetCommState, SetCommTimeouts,
+};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
+};
 use wmi::{COMLibrary, WMIConnection};
 
 use super::SerialPortPath;
@@ -239,30 +249,205 @@ struct SerialPortRow {
 }
 
 impl SerialPortPath {
-    pub(crate) fn send_serial_command_and_capture(
-        &self,
-        _command: &str,
-    ) -> Result<Vec<u8>, String> {
-        self.open_serial_port()?;
-        Err("send_serial_command_and_capture is not supported on windows yet".to_string())
+    pub(crate) fn send_serial_command_and_capture(&self, command: &str) -> Result<Vec<u8>, String> {
+        const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+        const SCREEN_CAPTURE_IDLE: Duration = Duration::from_millis(300);
+
+        let mut port = self.open_serial_port()?;
+        let payload = format!("{command}\n");
+        port.write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write command to '{}': {e}", self))?;
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let start = Instant::now();
+        let mut last_read = Instant::now();
+
+        loop {
+            match port.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    out.extend_from_slice(&buf[..n]);
+                    last_read = Instant::now();
+                }
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    return Err(format!("failed to read serial data from '{}': {e}", self));
+                }
+            }
+
+            if !out.is_empty() && Instant::now().duration_since(last_read) >= SCREEN_CAPTURE_IDLE {
+                break;
+            }
+
+            if Instant::now().duration_since(start) >= SCREEN_CAPTURE_TIMEOUT {
+                break;
+            }
+        }
+
+        if out.is_empty() {
+            return Err(format!(
+                "no serial response received from '{}'; verify the device is unlocked and in app mode",
+                self
+            ));
+        }
+
+        Ok(out)
     }
 
-    pub(crate) fn send_serial_command(&self, _command: &str) -> Result<(), String> {
-        self.open_serial_port()?;
-        Err("send_serial_command is not supported on windows yet".to_string())
+    pub(crate) fn send_serial_command(&self, command: &str) -> Result<(), String> {
+        let mut port = self.open_serial_port()?;
+        let payload = format!("{command}\n");
+        port.write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write command to '{}': {e}", self))?;
+        Ok(())
     }
 
-    fn open_serial_port(&self) -> Result<(), String> {
-        Err(format!(
-            "opening serial port '{}' is not supported on windows yet",
-            self
-        ))
+    fn open_serial_port(&self) -> Result<WindowsSerialPort, String> {
+        WindowsSerialPort::open(self)
     }
+}
+
+struct WindowsSerialPort {
+    handle: HANDLE,
+}
+
+impl WindowsSerialPort {
+    fn open(path: &SerialPortPath) -> Result<Self, String> {
+        let port_name = normalize_windows_com_port(&path.as_path().to_string_lossy());
+        let wide_name: Vec<u16> = port_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let handle = unsafe {
+            CreateFileW(
+                wide_name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!("failed to open serial port '{}'", path));
+        }
+
+        let mut port = Self { handle };
+        port.configure_8n1_115200(path)?;
+        Ok(port)
+    }
+
+    fn configure_8n1_115200(&mut self, path: &SerialPortPath) -> Result<(), String> {
+        let mut dcb: DCB = unsafe { std::mem::zeroed() };
+        dcb.DCBlength = std::mem::size_of::<DCB>() as u32;
+        let ok = unsafe { GetCommState(self.handle, &mut dcb) };
+        if ok == 0 {
+            return Err(format!("failed to read serial settings for '{}'", path));
+        }
+
+        dcb.BaudRate = 115_200;
+        dcb.ByteSize = 8;
+        dcb.Parity = NOPARITY;
+        dcb.StopBits = ONESTOPBIT;
+        // DCB bitfield: keep only fBinary=1 and disable flow control/parity helpers.
+        dcb._bitfield = 1;
+
+        let ok = unsafe { SetCommState(self.handle, &dcb) };
+        if ok == 0 {
+            return Err(format!(
+                "failed to configure serial settings for '{}'",
+                path
+            ));
+        }
+
+        let timeouts = COMMTIMEOUTS {
+            ReadIntervalTimeout: 10,
+            ReadTotalTimeoutMultiplier: 0,
+            ReadTotalTimeoutConstant: 100,
+            WriteTotalTimeoutMultiplier: 0,
+            WriteTotalTimeoutConstant: 1000,
+        };
+        let ok = unsafe { SetCommTimeouts(self.handle, &timeouts) };
+        if ok == 0 {
+            return Err(format!("failed to set serial timeouts for '{}'", path));
+        }
+
+        unsafe {
+            PurgeComm(self.handle, PURGE_RXCLEAR | PURGE_TXCLEAR);
+        }
+        Ok(())
+    }
+
+    fn write_all(&mut self, payload: &[u8]) -> Result<(), String> {
+        let mut written_total = 0usize;
+        while written_total < payload.len() {
+            let mut wrote = 0u32;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    payload[written_total..].as_ptr(),
+                    (payload.len() - written_total) as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err("WriteFile failed".to_string());
+            }
+            if wrote == 0 {
+                return Err("WriteFile wrote zero bytes".to_string());
+            }
+            written_total += wrote as usize;
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(read as usize)
+    }
+}
+
+impl Drop for WindowsSerialPort {
+    fn drop(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+fn normalize_windows_com_port(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if let Some(suffix) = upper.strip_prefix("COM")
+        && suffix.parse::<u32>().ok().is_some_and(|n| n >= 10)
+    {
+        return format!(r"\\.\{trimmed}");
+    }
+    trimmed.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_drive_id, parse_serial_from_pnp_device_id, wql_escape};
+    use super::{
+        normalize_drive_id, normalize_windows_com_port, parse_serial_from_pnp_device_id, wql_escape,
+    };
 
     #[test]
     fn parses_playdate_serial_from_windows_pnp_device_id() {
@@ -285,5 +470,11 @@ mod tests {
             wql_escape(r"\\.\PHYSICALDRIVE3's"),
             r"\\\\.\\PHYSICALDRIVE3''s"
         );
+    }
+
+    #[test]
+    fn normalizes_com_ports_for_windows_api() {
+        assert_eq!(normalize_windows_com_port("COM3"), "COM3");
+        assert_eq!(normalize_windows_com_port("COM10"), r"\\.\COM10");
     }
 }
