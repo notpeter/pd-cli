@@ -14,6 +14,7 @@ mod windows;
 pub(crate) struct SerialPortPath(PathBuf);
 
 impl SerialPortPath {
+    #[allow(dead_code)]
     pub(crate) fn new(path: PathBuf) -> Self {
         Self(path)
     }
