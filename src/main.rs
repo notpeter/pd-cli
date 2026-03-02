@@ -6,12 +6,13 @@ mod screenshot;
 mod stats;
 mod usb;
 
-use crate::command::{Command, LogFormat, parse_command_from_env};
+use crate::cli::parse_command_from_env;
+use crate::command::{Command, LogFormat};
 use crate::device::{DeviceList, DeviceLog};
 use crate::platform::open_with_default_viewer;
 use crate::screenshot::capture_screenshot;
 use crate::stats::print_stats_json;
-use crate::usb::{get_device, resolve_mount_target};
+use crate::usb::{get_device, wait_for_selected_device};
 
 pub(crate) const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 pub(crate) const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
@@ -46,7 +47,7 @@ fn run() -> Result<(), String> {
             );
         }
         Command::Mount { device, open } => {
-            let mut device = resolve_mount_target(&device)?;
+            let mut device = wait_for_selected_device(&device)?;
             device.mount_device()?;
             let mount_path = device
                 .mount_path()

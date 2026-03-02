@@ -1,44 +1,8 @@
-use clap::{Parser, Subcommand, ValueEnum};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum LogFormat {
-    Text,
-    Jsonl,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ParsedCli {
-    pub(crate) command: DeviceCommand,
-    pub(crate) log_format: LogFormat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DeviceCommand {
-    List,
-    Eject {
-        device_id: Option<String>,
-    },
-    Serial {
-        device_id: Option<String>,
-        command: String,
-    },
-    Mount {
-        device_id: Option<String>,
-        open: bool,
-    },
-    Screenshot {
-        device_id: Option<String>,
-        filename: Option<String>,
-        open: bool,
-    },
-    Stats {
-        device_id: Option<String>,
-        json: bool,
-    },
-    Hibernate {
-        device_id: Option<String>,
-    },
-}
+use crate::command::{
+    Command, LogFormat, ParsedCommand, SerialCommand, parse_device_selector,
+};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "pd")]
@@ -88,45 +52,57 @@ enum DeviceSubcommand {
     Hibernate,
 }
 
-pub(crate) fn parse_cli_from_env() -> Result<ParsedCli, String> {
+pub(crate) fn parse_command_from_env() -> Result<ParsedCommand, String> {
     let parsed = Cli::try_parse().map_err(|e| e.to_string())?;
-    Ok(map_parsed_cli(parsed))
+    map_parsed_cli(parsed)
 }
 
-fn map_parsed_cli(parsed: Cli) -> ParsedCli {
+fn map_parsed_cli(parsed: Cli) -> Result<ParsedCommand, String> {
     match parsed.command {
         TopLevelCommand::Device(device_cli) => {
             let DeviceCli { device_id, command } = device_cli;
             let command = match command {
-                DeviceSubcommand::List => DeviceCommand::List,
-                DeviceSubcommand::Eject => DeviceCommand::Eject { device_id },
-                DeviceSubcommand::Mount { open } => DeviceCommand::Mount { device_id, open },
-                DeviceSubcommand::Datadisk => DeviceCommand::Serial {
-                    device_id,
-                    command: "datadisk".to_string(),
+                DeviceSubcommand::List => Command::List,
+                DeviceSubcommand::Eject => Command::Eject {
+                    device: parse_device_selector(device_id)?,
                 },
-                DeviceSubcommand::Serial { command } => {
-                    DeviceCommand::Serial { device_id, command }
-                }
-                DeviceSubcommand::Stats { json } => DeviceCommand::Stats { device_id, json },
-                DeviceSubcommand::Screenshot { filename, open } => DeviceCommand::Screenshot {
-                    device_id,
-                    filename,
+                DeviceSubcommand::Mount { open } => Command::Mount {
+                    device: parse_device_selector(device_id)?,
                     open,
                 },
-                DeviceSubcommand::Hibernate => DeviceCommand::Hibernate { device_id },
+                DeviceSubcommand::Datadisk => Command::Serial {
+                    device: parse_device_selector(device_id)?,
+                    command: SerialCommand::parse("datadisk".to_string())?,
+                },
+                DeviceSubcommand::Serial { command } => Command::Serial {
+                    device: parse_device_selector(device_id)?,
+                    command: SerialCommand::parse(command)?,
+                },
+                DeviceSubcommand::Stats { json } => Command::Stats {
+                    device: parse_device_selector(device_id)?,
+                    json,
+                },
+                DeviceSubcommand::Screenshot { filename, open } => Command::Screenshot {
+                    device: parse_device_selector(device_id)?,
+                    filename: filename.map(PathBuf::from),
+                    open,
+                },
+                DeviceSubcommand::Hibernate => Command::Hibernate {
+                    device: parse_device_selector(device_id)?,
+                },
             };
-            ParsedCli {
+            Ok(ParsedCommand {
                 command,
                 log_format: parsed.log_format,
-            }
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, DeviceCommand, LogFormat, ParsedCli, map_parsed_cli};
+    use super::{Cli, map_parsed_cli};
+    use crate::command::{Command, DeviceSelector, LogFormat, ParsedCommand, SerialCommand};
     use clap::Parser;
 
     #[test]
@@ -134,10 +110,12 @@ mod tests {
         let parsed = Cli::try_parse_from(["pd", "device", "-d", "PDU1-Y012345", "mount", "--open"])
             .expect("mount parse should succeed");
         assert_eq!(
-            map_parsed_cli(parsed),
-            ParsedCli {
-                command: DeviceCommand::Mount {
-                    device_id: Some("PDU1-Y012345".to_string()),
+            map_parsed_cli(parsed).expect("map should succeed"),
+            ParsedCommand {
+                command: Command::Mount {
+                    device: DeviceSelector::BySerial(
+                        crate::device::DeviceSerial::parse("Y012345").unwrap()
+                    ),
                     open: true
                 },
                 log_format: LogFormat::Text
@@ -149,7 +127,26 @@ mod tests {
     fn parses_jsonl_log_format() {
         let parsed = Cli::try_parse_from(["pd", "--log-format", "jsonl", "device", "list"])
             .expect("parse should succeed");
-        let parsed = map_parsed_cli(parsed);
+        let parsed = map_parsed_cli(parsed).expect("map should succeed");
         assert_eq!(parsed.log_format, LogFormat::Jsonl);
+    }
+
+    #[test]
+    fn parses_datadisk_as_serial_command() {
+        let parsed = Cli::try_parse_from(["pd", "device", "-d", "Y012345", "datadisk"])
+            .expect("parse should succeed");
+        let parsed = map_parsed_cli(parsed).expect("map should succeed");
+        assert_eq!(
+            parsed,
+            ParsedCommand {
+                command: Command::Serial {
+                    device: DeviceSelector::BySerial(
+                        crate::device::DeviceSerial::parse("Y012345").unwrap()
+                    ),
+                    command: SerialCommand::parse("datadisk".to_string()).unwrap(),
+                },
+                log_format: LogFormat::Text,
+            }
+        );
     }
 }

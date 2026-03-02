@@ -1,7 +1,5 @@
-use crate::cli::{
-    DeviceCommand as CliDeviceCommand, LogFormat as CliLogFormat, parse_cli_from_env,
-};
 use crate::device::DeviceSerial;
+use clap::ValueEnum;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +16,7 @@ impl SerialCommand {
         &self.0
     }
 
-    fn parse(raw: String) -> Result<Self, String> {
+    pub(crate) fn parse(raw: String) -> Result<Self, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err("serial command cannot be empty".to_string());
@@ -56,7 +54,7 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum LogFormat {
     Text,
     Jsonl,
@@ -68,59 +66,7 @@ pub(crate) struct ParsedCommand {
     pub(crate) log_format: LogFormat,
 }
 
-pub(crate) fn parse_command_from_env() -> Result<ParsedCommand, String> {
-    let parsed = parse_cli_from_env()?;
-    Ok(ParsedCommand {
-        command: map_parsed_command(parsed.command)?,
-        log_format: map_log_format(parsed.log_format),
-    })
-}
-
-fn map_log_format(format: CliLogFormat) -> LogFormat {
-    // TODO: Make this --json / --text not `--log-format {jsonl,text}`
-    match format {
-        CliLogFormat::Text => LogFormat::Text,
-        CliLogFormat::Jsonl => LogFormat::Jsonl,
-    }
-}
-
-fn map_parsed_command(command: CliDeviceCommand) -> Result<Command, String> {
-    match command {
-        CliDeviceCommand::List => Ok(Command::List),
-        CliDeviceCommand::Eject { device_id } => Ok(Command::Eject {
-            device: parse_device_selector(device_id)?,
-        }),
-        CliDeviceCommand::Serial { device_id, command } => Ok(Command::Serial {
-            device: parse_device_selector(device_id)?,
-            command: SerialCommand::parse(command)?,
-        }),
-        CliDeviceCommand::Mount { device_id, open } => Ok(Command::Mount {
-            device: parse_device_selector(device_id)?,
-            open,
-        }),
-        CliDeviceCommand::Screenshot {
-            device_id,
-            filename,
-            open,
-        } => {
-            let filename = filename.map(PathBuf::from);
-            Ok(Command::Screenshot {
-                device: parse_device_selector(device_id)?,
-                filename,
-                open,
-            })
-        }
-        CliDeviceCommand::Stats { device_id, json } => Ok(Command::Stats {
-            device: parse_device_selector(device_id)?,
-            json,
-        }),
-        CliDeviceCommand::Hibernate { device_id } => Ok(Command::Hibernate {
-            device: parse_device_selector(device_id)?,
-        }),
-    }
-}
-
-fn parse_device_selector(raw: Option<String>) -> Result<DeviceSelector, String> {
+pub(crate) fn parse_device_selector(raw: Option<String>) -> Result<DeviceSelector, String> {
     match raw {
         None => Ok(DeviceSelector::Auto),
         Some(id) => {
@@ -134,10 +80,7 @@ fn parse_device_selector(raw: Option<String>) -> Result<DeviceSelector, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Command, DeviceSelector, SerialCommand, map_parsed_command, parse_device_selector,
-    };
-    use crate::cli::DeviceCommand as CliDeviceCommand;
+    use super::{DeviceSelector, SerialCommand, parse_device_selector};
 
     #[test]
     fn parses_device_selector_from_serial() {
@@ -158,24 +101,5 @@ mod tests {
     fn rejects_empty_serial_command() {
         let err = SerialCommand::parse("  ".to_string()).expect_err("should fail");
         assert_eq!(err, "serial command cannot be empty");
-    }
-
-    #[test]
-    fn maps_stats_command_with_selector() {
-        let mapped = map_parsed_command(CliDeviceCommand::Stats {
-            device_id: Some("Y012345".to_string()),
-            json: true,
-        })
-        .expect("mapping should succeed");
-
-        assert_eq!(
-            mapped,
-            Command::Stats {
-                device: DeviceSelector::BySerial(
-                    crate::device::DeviceSerial::parse("Y012345").unwrap()
-                ),
-                json: true,
-            }
-        );
     }
 }

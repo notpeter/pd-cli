@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREEN_PREFIX: &[u8] = b"screen\r\n~screen:\n";
-const SCREEN_PREFIX_LEGACY: &[u8] = b"\r\nscreen~:\n";
 const SCREEN_BITMAP_BYTES: usize = 12_000;
 const SCREEN_WIDTH: u32 = 400;
 const SCREEN_HEIGHT: u32 = 240;
@@ -92,19 +91,6 @@ fn extract_screen_bitmap(payload: &[u8]) -> Result<&[u8], String> {
         return Ok(&payload[start..end]);
     }
 
-    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX_LEGACY) {
-        let start = offset + SCREEN_PREFIX_LEGACY.len();
-        let end = start + SCREEN_BITMAP_BYTES;
-        if payload.len() < end {
-            return Err(format!(
-                "legacy screen payload is incomplete: got {} bytes, expected at least {}",
-                payload.len().saturating_sub(start),
-                SCREEN_BITMAP_BYTES
-            ));
-        }
-        return Ok(&payload[start..end]);
-    }
-
     if payload.len() >= SCREEN_BITMAP_BYTES {
         return Ok(&payload[..SCREEN_BITMAP_BYTES]);
     }
@@ -143,9 +129,7 @@ fn timestamp_now() -> String {
 }
 
 fn inspect_screen_payload(payload: &[u8], path: &Path) -> String {
-    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX)
-        .or_else(|| find_subslice(payload, SCREEN_PREFIX_LEGACY))
-    {
+    if let Some(offset) = find_subslice(payload, SCREEN_PREFIX) {
         let image_start = offset + SCREEN_PREFIX.len();
         let remaining = payload.len().saturating_sub(image_start);
         if remaining >= SCREEN_BITMAP_BYTES {

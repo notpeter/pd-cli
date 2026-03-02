@@ -60,7 +60,7 @@ pub(crate) fn list_serial_ports_from_dev() -> Vec<SerialPortPath> {
             let Some(device_key) = extract_device_key_from_port_name(&name) else {
                 continue;
             };
-            ports.push(SerialPortPath::with_device_key(
+            ports.push(SerialPortPath::new(
                 format!("/dev/{name}").into(),
                 device_key,
             ));

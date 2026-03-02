@@ -45,7 +45,7 @@ pub(crate) fn get_device(device: &DeviceSelector) -> Result<Device, String> {
     resolve_device(devices, device)
 }
 
-pub(crate) fn resolve_mount_target(device: &DeviceSelector) -> Result<Device, String> {
+pub(crate) fn wait_for_selected_device(device: &DeviceSelector) -> Result<Device, String> {
     let start = Instant::now();
 
     loop {

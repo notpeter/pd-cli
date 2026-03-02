@@ -18,10 +18,10 @@ impl DeviceSerial {
             .collect();
 
         let core = compact.strip_prefix("PDU1").unwrap_or(&compact);
-        if core.len() < 2 || !core.starts_with('Y') {
+        if core.len() != 7 || !core.starts_with('Y') {
             return None;
         }
-        if !core.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !core[1..].chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
 
@@ -207,5 +207,12 @@ mod tests {
             log.to_jsonl(),
             r#"{"msg":"Sent serial command: hibernate","serial_number":"PDU1-Y012345"}"#
         );
+    }
+
+    #[test]
+    fn serial_parse_rejects_invalid_lengths_and_non_digits() {
+        assert!(DeviceSerial::parse("Y01234").is_none());
+        assert!(DeviceSerial::parse("Y0123456").is_none());
+        assert!(DeviceSerial::parse("Y01A345").is_none());
     }
 }
