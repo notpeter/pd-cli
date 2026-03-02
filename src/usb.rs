@@ -247,10 +247,10 @@ mod tests {
     fn matches_windows_port_by_serial_hint() {
         let serial = DeviceSerial::parse("Y012345").expect("valid serial");
         let ports = vec![SerialPortPath::with_device_serial_core(
-            PathBuf::from("COM7"),
+            PathBuf::from(r"\\.\COM7"),
             "Y012345".to_string(),
         )];
         let port = find_port_for_serial(&ports, &serial).expect("port should resolve");
-        assert_eq!(port.to_string(), "COM7");
+        assert_eq!(port.to_string(), r"\\.\COM7");
     }
 }

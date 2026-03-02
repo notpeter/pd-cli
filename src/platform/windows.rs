@@ -61,8 +61,9 @@ pub(crate) fn list_serial_ports() -> Vec<SerialPortPath> {
             continue;
         }
 
+        let device_path = format!(r"\\.\{device_id}");
         ports.push(SerialPortPath::with_device_serial_core(
-            device_id.into(),
+            device_path.into(),
             serial.core().to_string(),
         ));
     }
@@ -316,8 +317,12 @@ struct WindowsSerialPort {
 
 impl WindowsSerialPort {
     fn open(path: &SerialPortPath) -> Result<Self, String> {
-        let port_name = normalize_windows_com_port(&path.as_path().to_string_lossy());
-        let wide_name: Vec<u16> = port_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_name: Vec<u16> = path
+            .as_path()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let handle = unsafe {
             CreateFileW(
@@ -432,22 +437,9 @@ impl Drop for WindowsSerialPort {
     }
 }
 
-fn normalize_windows_com_port(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    if let Some(suffix) = upper.strip_prefix("COM")
-        && suffix.parse::<u32>().ok().is_some_and(|n| n >= 10)
-    {
-        return format!(r"\\.\{trimmed}");
-    }
-    trimmed.to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        normalize_drive_id, normalize_windows_com_port, parse_serial_from_pnp_device_id, wql_escape,
-    };
+    use super::{normalize_drive_id, parse_serial_from_pnp_device_id, wql_escape};
 
     #[test]
     fn parses_playdate_serial_from_windows_pnp_device_id() {
@@ -473,8 +465,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_com_ports_for_windows_api() {
-        assert_eq!(normalize_windows_com_port("COM3"), "COM3");
-        assert_eq!(normalize_windows_com_port("COM10"), r"\\.\COM10");
+    fn normalizes_com_port_path_at_discovery() {
+        use crate::platform::SerialPortPath;
+        let port = SerialPortPath::with_device_serial_core(
+            format!(r"\\.\COM3").into(),
+            "Y012345".to_string(),
+        );
+        assert_eq!(port.to_string(), r"\\.\COM3");
     }
 }
