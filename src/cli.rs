@@ -44,6 +44,10 @@ enum DeviceSubcommand {
         #[arg(allow_hyphen_values = true)]
         crank: String,
     },
+    Version {
+        #[arg(long = "json")]
+        json: bool,
+    },
     Serial {
         command: String,
     },
@@ -88,6 +92,10 @@ fn map_parsed_cli(parsed: Cli) -> Result<ParsedCommand, String> {
                 DeviceSubcommand::Crank { crank } => Command::Crank {
                     device: parse_device_selector(device_id)?,
                     crank: CrankCommand::parse(crank)?,
+                },
+                DeviceSubcommand::Version { json } => Command::Version {
+                    device: parse_device_selector(device_id)?,
+                    json,
                 },
                 DeviceSubcommand::Serial { command } => Command::Serial {
                     device: parse_device_selector(device_id)?,
@@ -158,6 +166,39 @@ mod tests {
                     command: SerialCommand::parse("datadisk".to_string()).unwrap(),
                 },
                 log_format: LogFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_version_command() {
+        let parsed = Cli::try_parse_from(["pd", "device", "version"]).expect("parse should work");
+        let parsed = map_parsed_cli(parsed).expect("map should succeed");
+        assert_eq!(
+            parsed,
+            ParsedCommand {
+                command: Command::Version {
+                    device: DeviceSelector::Auto,
+                    json: false
+                },
+                log_format: LogFormat::Text
+            }
+        );
+    }
+
+    #[test]
+    fn parses_version_json_flag() {
+        let parsed =
+            Cli::try_parse_from(["pd", "device", "version", "--json"]).expect("parse should work");
+        let parsed = map_parsed_cli(parsed).expect("map should succeed");
+        assert_eq!(
+            parsed,
+            ParsedCommand {
+                command: Command::Version {
+                    device: DeviceSelector::Auto,
+                    json: true
+                },
+                log_format: LogFormat::Text
             }
         );
     }

@@ -169,6 +169,10 @@ pub(crate) enum Command {
         device: DeviceSelector,
         crank: CrankCommand,
     },
+    Version {
+        device: DeviceSelector,
+        json: bool,
+    },
     Mount {
         device: DeviceSelector,
         open: bool,

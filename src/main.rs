@@ -5,6 +5,7 @@ mod platform;
 mod screenshot;
 mod stats;
 mod usb;
+mod version;
 
 use crate::cli::parse_command_from_env;
 use crate::command::{Command, LogFormat};
@@ -13,6 +14,7 @@ use crate::platform::open_with_default_viewer;
 use crate::screenshot::capture_screenshot;
 use crate::stats::print_stats_json;
 use crate::usb::{get_device, wait_for_selected_device};
+use crate::version::print_version_json;
 
 pub(crate) const PLAYDATE_VENDOR_ID: u16 = 0x1331;
 pub(crate) const PLAYDATE_PRODUCT_ID_MSC: u16 = 0x5741;
@@ -59,6 +61,23 @@ fn run() -> Result<(), String> {
             device.send_command(serial.as_str())?;
             let log = device.log(format!("Sent crank command: {serial}"));
             emit_log(log_format, log);
+        }
+        Command::Version { device, json } => {
+            let device = get_device(&device)?;
+            let version = device.fetch_version()?;
+            if json {
+                print_version_json(&version);
+            } else {
+                emit_log(log_format, device.log("Version"));
+                match log_format {
+                    LogFormat::Text => {
+                        for (k, v) in version {
+                            println!("{k}: {v}");
+                        }
+                    }
+                    LogFormat::Json => print_version_json(&version),
+                }
+            }
         }
         Command::Mount { device, open } => {
             let mut device = wait_for_selected_device(&device)?;

@@ -87,6 +87,15 @@ impl Device {
         Ok(())
     }
 
+    pub(crate) fn send_command_and_capture(&self, command: &str) -> Result<Vec<u8>, String> {
+        let Some(port) = self.port() else {
+            return Err(format!(
+                "{self} has no serial port available; is the disk mounted?"
+            ));
+        };
+        port.send_serial_command_and_capture(command)
+    }
+
     pub(crate) fn wait_for_mount_ready(&self) -> Result<String, String> {
         let start = Instant::now();
         let mut last_seen_mount: Option<String> = None;
